@@ -5,7 +5,11 @@ const fs = require('node:fs');
 const { migrateSqlite, migrateMysql } = require('./identity-migration');
 const { migrateSqliteUserIds, migrateMysqlUserIds } = require('./user-id-migration');
 const { migrateSqliteEntityIds, migrateMysqlEntityIds } = require('./entity-id-migration');
+const { migrateModerationSqlite, migrateModerationMysql } = require('./moderation-migration');
 const { createId } = require('./entity-id');
+
+// 审计留存期：与 src/audit.js 的 RETENTION_DAYS 同源，避免代码与清理口径不一致。
+const { RETENTION_DAYS } = require('./audit-retention');
 
 const DRIVER = (process.env.DB_DRIVER || 'mysql').toLowerCase();
 if (DRIVER !== 'sqlite' && DRIVER !== 'mysql') {
@@ -17,6 +21,15 @@ const db = { driver: DRIVER };
 // 预置专区（幂等）。
 // 必须在下面的驱动分支之前声明：initSqlite() 会在模块求值期间同步跑完，
 // 若把 SEED_ZONES 放在其后会踩到 const 的暂时性死区（TDZ）导致启动即崩。
+//
+// 审计字段迁移：port（源端口）、platform（客户端平台）、login_type（登录类型）。
+// 同样必须在驱动分支之前声明；独立函数、幂等，既有行为 NULL。
+const AUDIT_COLUMNS = [
+  ['port', 'INTEGER', 'INT'],
+  ['platform', 'TEXT', 'VARCHAR(64)'],
+  ['login_type', 'TEXT', 'VARCHAR(32)'],
+];
+
 const SEED_ZONES = [
   { key: 'java', name: 'Java', sort: 1 },
   { key: 'python', name: 'Python', sort: 2 },
@@ -275,6 +288,7 @@ CREATE TABLE IF NOT EXISTS terminal_coord (
   const taskColumns = sqlite.prepare('PRAGMA table_info(task_config)').all().map(column => column.name);
   if (!taskColumns.includes('event_key')) sqlite.exec("ALTER TABLE task_config ADD COLUMN event_key TEXT NOT NULL DEFAULT ''");
   if (!taskColumns.includes('target_count')) sqlite.exec('ALTER TABLE task_config ADD COLUMN target_count INTEGER NOT NULL DEFAULT 1');
+  migrateAuditColumnsSqlite(sqlite);
   sqlite.exec("UPDATE task_config SET event_key = `key` WHERE event_key = ''");
   sqlite.exec("UPDATE task_config SET label = '创建项目' WHERE `key` = 'create_project' AND label = '创建工程'");
   sqlite.exec("UPDATE task_config SET label = '修改文件' WHERE `key` = 'save_file' AND label = '修改并保存文件'");
@@ -285,10 +299,10 @@ CREATE TABLE IF NOT EXISTS terminal_coord (
   const backfillEvent = sqlite.prepare('INSERT INTO task_events (user_id, event_id, date, event_key) VALUES (?, ?, ?, ?)');
   for (const claim of legacyClaims) backfillEvent.run(claim.user_id, createId('task_events'), claim.date, claim.task_key);
 
-  // 审计日志保留 90 天，启动时清理一次。
+  // 审计日志保留 365 天，启动时清理一次。
   try {
     sqlite.prepare(
-      "DELETE FROM audit_logs WHERE created_at < datetime('now', '-90 days')",
+      `DELETE FROM audit_logs WHERE created_at < datetime('now', '-${RETENTION_DAYS} days')`,
     ).run();
   } catch (_) {}
 
@@ -296,6 +310,8 @@ CREATE TABLE IF NOT EXISTS terminal_coord (
     'INSERT OR IGNORE INTO zones (id, key, name, sort) VALUES (?, ?, ?, ?)',
   );
   for (const z of SEED_ZONES) insertZone.run(createId('zones'), z.key, z.name, z.sort);
+  // 2026-11 合规整改：审核相关列与表，独立迁移块。
+  db.moderationMigrated = migrateModerationSqlite(sqlite);
   await seedTasks((sql, params) => sqlite.prepare(sql).run(...params));
 }
 
@@ -479,6 +495,7 @@ async function initMysql(pool, cfg) {
   if (!slotColumns.some(column => column.Field === 'reclaim_user_id')) {
     await pool.query("ALTER TABLE terminal_slots ADD COLUMN reclaim_user_id VARCHAR(37) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''");
   }
+  await migrateAuditColumnsMysql(pool);
   await pool.query("UPDATE task_config SET event_key = `key` WHERE event_key = ''");
   await pool.query("UPDATE task_config SET label = '创建项目' WHERE `key` = 'create_project' AND label = '创建工程'");
   await pool.query("UPDATE task_config SET label = '修改文件' WHERE `key` = 'save_file' AND label = '修改并保存文件'");
@@ -493,9 +510,9 @@ async function initMysql(pool, cfg) {
   await pool.query('INSERT IGNORE INTO user_state (user_id) SELECT id FROM users');
   await pool.query("INSERT IGNORE INTO terminal_coord (`key`, version, updated_at) VALUES ('pool', 1, 0)");
 
-  // 审计日志保留 90 天，启动时清理一次。
+  // 审计日志保留 365 天，启动时清理一次。
   try {
-    await pool.query('DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL 90 DAY');
+    await pool.query(`DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL ${RETENTION_DAYS} DAY`);
   } catch (_) {}
 
   for (const z of SEED_ZONES) {
@@ -506,7 +523,26 @@ async function initMysql(pool, cfg) {
       z.sort,
     ]);
   }
+  // 2026-11 合规整改：审核相关列与表，独立迁移块。
+  db.moderationMigrated = await migrateModerationMysql(pool);
   await seedTasks((sql, params) => pool.query(sql.replace('INSERT OR IGNORE', 'INSERT IGNORE'), params));
+}
+
+// 审计字段迁移：port（源端口）、platform（客户端平台）、login_type（登录类型）。
+// 独立函数、幂等；既有行为 NULL，不影响历史查询。
+function migrateAuditColumnsSqlite(sqlite) {
+  const existing = new Set(sqlite.prepare('PRAGMA table_info(audit_logs)').all().map(c => c.name));
+  for (const [name, sqliteType] of AUDIT_COLUMNS) {
+    if (!existing.has(name)) sqlite.exec(`ALTER TABLE audit_logs ADD COLUMN ${name} ${sqliteType}`);
+  }
+}
+
+async function migrateAuditColumnsMysql(pool) {
+  const [columns] = await pool.query('SHOW COLUMNS FROM audit_logs');
+  const existing = new Set(columns.map(column => column.Field));
+  for (const [name, , mysqlType] of AUDIT_COLUMNS) {
+    if (!existing.has(name)) await pool.query(`ALTER TABLE audit_logs ADD COLUMN ${name} ${mysqlType}`);
+  }
 }
 
 async function seedTasks(run) {
