@@ -1,10 +1,12 @@
 // AI 编程助手：服务端固定上游地址、密钥和模型，客户端只能提交消息与工具。
-// 另提供联网工具：web_search 走可替换的搜索 provider，web_fetch 带 SSRF 守卫。
+// 另提供联网抓取工具：web_fetch 带 SSRF 守卫。
+//
+// web_search 已于 2026-11 合规整改下线：搜索走 Bing，会引入未披露的第三方。
+// 工具不再对外暴露，客户端也同步移除（§1 不得新增未披露的第三方）。
 const express = require('express');
 const { authRequired } = require('../util');
 const { audit } = require('../audit');
 const ai = require('../ai-client');
-const search = require('../web-search');
 const webFetch = require('../web-fetch');
 
 const router = express.Router();
@@ -27,7 +29,7 @@ router.post('/chat', authRequired, async (req, res) => {
 
 // ---- 联网工具 ----
 
-// 每用户每分钟上限，避免把搜索当成抓取代理滥用。
+// 每用户每分钟上限，避免把抓取当成代理滥用。
 const WEB_RATE_LIMIT = 30;
 const WEB_WINDOW_MS = 60 * 1000;
 const webWindows = new Map();
@@ -61,33 +63,6 @@ function replyError(res, error) {
   const status = Number.isInteger(error.status) ? error.status : 400;
   res.status(status).json({ error: error.message });
 }
-
-router.post('/web_search', authRequired, async (req, res) => {
-  const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
-  if (!query) return res.status(400).json({ error: '查询不能为空' });
-  if (query.length > search.MAX_QUERY_LENGTH) {
-    return res.status(400).json({ error: `查询超过 ${search.MAX_QUERY_LENGTH} 字符` });
-  }
-  const provider = search.providerByName(process.env.QFLI_SEARCH_PROVIDER);
-  if (!provider) return res.status(503).json({ error: '搜索服务未配置' });
-  const limit = Number(req.body?.limit);
-  let results;
-  try {
-    admitWeb(req.userId);
-    results = await provider.search(query, {
-      limit: Number.isFinite(limit) ? limit : search.MAX_RESULTS,
-    });
-  } catch (error) {
-    return replyError(res, error);
-  }
-  await audit(req, {
-    action: 'ai.web_search',
-    target: `ai:${req.userId}`,
-    // 只记录条数与 provider，不记录查询内容。
-    detail: `provider=${provider.name} results=${results.length}`,
-  });
-  res.json({ provider: provider.name, results });
-});
 
 router.post('/web_fetch', authRequired, async (req, res) => {
   const url = typeof req.body?.url === 'string' ? req.body.url.trim() : '';

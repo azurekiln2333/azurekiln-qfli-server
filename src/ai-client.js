@@ -283,6 +283,8 @@ function resultData(data, model) {
   // 无工具调用时必须有非空文本，否则客户端无法渲染这一轮。
   if (!toolCalls && !content) throw new ApiError(502, 'AI 服务响应无效');
   const result = {
+    // 客户端据此显示“内容由 AI 生成”标识（2026-11 整改任务书 §3-W3）。
+    aiGenerated: true,
     model,
     message: {
       role: 'assistant',

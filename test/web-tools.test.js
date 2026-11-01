@@ -1,43 +1,23 @@
-// 联网工具的离线单测：搜索解析、SSRF 守卫、正文提取与路由边界。
-// 不访问外网：provider 与 DNS 全部注入替身。
+// 联网抓取工具的离线单测：SSRF 守卫、正文提取与路由边界。
+// 不访问外网：DNS 全部注入替身。
+//
+// 2026-11 合规整改：web_search 已下线（搜索走 Bing，属未披露的第三方），
+// 原先的 RSS 解析与 provider 用例随 src/web-search.js 一起删除。
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const search = require('../src/web-search');
+const path = require('node:path');
+const fs = require('node:fs');
+
 const webFetch = require('../src/web-fetch');
+const AI_ROUTES = path.join(__dirname, '..', 'src', 'routes', 'ai.js');
 
-const RSS_FIXTURE = `<?xml version="1.0" encoding="utf-8" ?>
-<rss version="2.0"><channel><title>必应：flutter dart 教程</title>
-<item><title>Flutter - Build apps for any screen</title>
-<link>https://flutter.dev/</link>
-<description>Flutter transforms the app development process.</description></item>
-<item><title><![CDATA[Flutter 教程 | 菜鸟教程]]></title>
-<link>https://www.runoob.com/flutter/flutter-tutorial.html</link>
-<description>Flutter 是一个用于构建跨平台应用的 UI 工具包 &amp; 更多。</description></item>
-<item><title>Bad</title><link>javascript:alert(1)</link><description>x</description></item>
-<item><title></title><link></link><description></description></item>
-</channel></rss>`;
-
-test('parseRss keeps real items and drops unsafe links', () => {
-  const results = search.parseRss(RSS_FIXTURE, 8);
-  assert.equal(results.length, 2);
-  assert.equal(results[0].title, 'Flutter - Build apps for any screen');
-  assert.equal(results[0].url, 'https://flutter.dev/');
-  assert.equal(results[1].title, 'Flutter 教程 | 菜鸟教程');
-  assert.equal(results[1].snippet, 'Flutter 是一个用于构建跨平台应用的 UI 工具包 & 更多。');
-});
-
-test('parseRss honours the limit', () => {
-  assert.equal(search.parseRss(RSS_FIXTURE, 1).length, 1);
-});
-
-test('stripTags removes markup and decodes entities', () => {
-  assert.equal(search.stripTags('<b>a</b> &amp; <i>b</i>'), 'a & b');
-});
-
-test('unknown provider names fail closed', () => {
-  assert.equal(search.providerByName('nope'), null);
-  assert.equal(search.providerByName('').name, 'bing-rss');
+test('the web search module and its Bing call are gone', () => {
+  assert.equal(fs.existsSync(path.join(__dirname, '..', 'src', 'web-search.js')), false,
+    'src/web-search.js must stay deleted');
+  const aiRoutes = fs.readFileSync(AI_ROUTES, 'utf8');
+  assert.ok(!/bing\.com/i.test(aiRoutes), 'the AI router must not reference Bing');
+  assert.ok(!/web_search\s*'/.test(aiRoutes), 'web_search must not be exposed');
 });
 
 test('SSRF guard rejects loopback, link-local and private ranges', () => {

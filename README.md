@@ -304,6 +304,44 @@ bash /root/qfli-sqlbox-bootstrap.sh --business-env /www/wwwroot/azurekiln-qfli-s
 发布闸门顺序固定：封停/禁言 → 限流 → IP 规则 → 文本审核 → 先审后发判定。
 限流按用户分别限制发帖与评论（`PUBLISH_RATE_*`、`COMMENT_RATE_*`），计数落库，重启不清零。
 
+## 2026-11 合规整改（服务端部分）
+
+### 日志与可信代理
+
+`audit_logs` 保留 **365 天**，写入侧 `src/audit-retention.js` 与启动清理共用同一常量。
+每行带 `ip`、`port`、`platform`、`login_type`。平台取自请求头 `X-Client-Platform`
+（`harmonyos-app/<版本号>` 等），只存平台名；登录类型取 `password`、`huawei_login`、
+`huawei_skip`、`huawei_bind`、`huawei_mfa`、`oauth2`、`register`、`logout`。
+登录、注册、登出都落库。
+
+地址只信任反向代理覆盖写入的 `X-Real-IP` / `X-Real-Port`，`X-Forwarded-For` 一律不读，
+也不启用 Express `trust proxy`。nginx 示例见 `docs/deployment/nginx.conf.example`。
+
+### 实名门槛
+
+没有已验证手机号的账号使用社区浏览、发帖、评论、点赞、举报、云项目、在线终端、AI 或
+SQL 沙箱，一律 403 `realname.required`，客户端引导走华为账号绑定手机号。
+本地内置教程不请求服务端，不受影响。`/api/users` 与 `/api/auth` 不受限，保证任何状态都能注销账号。
+
+华为登录在 `phoneAvailable === false` 时直接拒绝 `/huawei/skip` 与 `/huawei/bind`，
+返回 403 `realname.phone_required`，不再建号。
+
+### 永久注销
+
+`POST /api/users/me/deactivate`，请求体 `{confirm:"DEACTIVATE"}`，返回 `{status:"deactivated",deactivated:true,retentionDays:365}`。
+顺序固定：先调网关 `POST /oauth2/account/erase`（客户端凭据 Basic 鉴权，scope `qfli_account_erase`），
+网关拒绝或不可达就保留本地数据并返回错误，让用户重试；成功后删除
+`data/cloud/u<id>`、`data/terminals/u<id>`，事务内删除本站业务数据与会话，
+审计行保留 365 天但 `user_id` 换成 `deleted_<sha256>`、`username` 置空。
+
+### AI 与联网工具
+
+`QFLI_AI_BASE_URL` 线上只允许指向 DeepSeek 官方接口，不得改为第三方聚合网关，
+因为第三方清单只披露了深度求索。AI 响应固定带 `aiGenerated: true`，供客户端显示
+"内容由 AI 生成"。
+`POST /api/ai/web_search` 已下线（搜索走 Bing，属未披露的第三方），`src/web-search.js` 已删除；
+`POST /api/ai/web_fetch` 保留并继续执行 SSRF 守卫。
+
 成功登录返回 `{token,user}`，其中 `user.id` 是 `user_` 开头的字符串本地 ID，`user.gatewayUserId` 是网关 sub。`user.avatarUrl` 来自网关 `picture`，App 个人页显示该图片。
 受保护 API 使用 `Authorization: Bearer <QFLI token>`。社区、云项目、在线终端 API 保持原路径。
 本地项目与文件操作只能由客户端上报，服务端无法核验设备文件系统。默认每种操作设每日 1、5、10 次任务，达到每个档位时分别领取一次；`GET /me/tasks` 返回当日 `day`、每档 `progress/target/eventKey/done`。客户端逐次保存本机计数及待同步事件，断网后使用同一个 `eventId` 重试；任务、签到日历和积分兑换数据优先读取账号本地缓存，每天自动更新一次，手动刷新强制重取。兑换项由管理员创建，服务端只记录待处理/已交付，不自动发货。积分流水记录本次上线后发生的变动，历史签到不会自动回填流水。

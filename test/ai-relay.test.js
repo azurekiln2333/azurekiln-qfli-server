@@ -145,6 +145,8 @@ test('tool round trip keeps tool_calls and fixes the model', async () => {
   const { status, body } = await post({ messages, tools });
   assert.equal(status, 200);
   assert.equal(body.model, 'deepseek-v4.1-flash');
+  // 客户端据此显示“内容由 AI 生成”标识。
+  assert.equal(body.aiGenerated, true);
   assert.deepEqual(body.message, {
     role: 'assistant',
     content: null,
