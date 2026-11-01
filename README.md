@@ -120,7 +120,20 @@ AZK_OAUTH2_SCOPE=openid profile email phone roles offline_access
 AZK_PROVIDER=qfli
 QFLI_TERMINAL_URL=http://127.0.0.1:3101
 QFLI_TERMINAL_SECRET=独立终端内部密钥，与执行服务相同
+MODERATION_BASE_URL=https://审核服务地址
+MODERATION_APP_ID=qflistudio
+MODERATION_API_KEY=审核服务发给本应用的 API key
+MODERATION_ADMIN_KEY=审核服务发给本应用的管理密钥
+MODERATION_TIMEOUT_MS=3000
+PUBLISH_RATE_PER_MINUTE=3
+PUBLISH_RATE_PER_DAY=20
+COMMENT_RATE_PER_MINUTE=10
+COMMENT_RATE_PER_DAY=100
 ```
+
+`MODERATION_*` 未配置时，发帖、评论、昵称/简介修改等发布类请求一律返回 503 `moderation.unavailable`，
+浏览类接口不受影响。这是有意的 failClosed 行为：审核服务不可用时不允许发布。
+部署时若审核服务与应用同机，可指向本机回环地址；跨机必须使用证书有效的 HTTPS。
 
 MySQL 数据库需提前创建；表结构由后端启动时自动创建或迁移。数据库账号需拥有该库的读写、建表、修改表和索引权限。MySQL 连接失败会停止启动，不会自动切换到 SQLite。
 
@@ -252,6 +265,44 @@ bash /root/qfli-sqlbox-bootstrap.sh --business-env /www/wwwroot/azurekiln-qfli-s
 | `GET/POST/PATCH /api/users/admin/rewards[/:id]` | 管理员维护兑换项、库存及上架状态 |
 | `GET/PATCH /api/users/admin/redemptions[/:id]` | 管理员查看兑换记录并标记已交付 |
 | `GET /api/users/me/posts` | 本站帖子 |
+
+### 内容审核与社区治理（2026-11 合规整改）
+
+审核能力由独立的公共审核服务提供（仓库 `azurekiln-moderation`），QFLI 侧只有薄适配层
+`src/moderation-service.js` 与传输层 `src/moderation-client.js`。审核逻辑、词库、IP 规则、
+人工审核队列都在审核服务里，本仓库不存任何判定数据。
+
+| 路径 | 内容 |
+| --- | --- |
+| `POST /api/posts` | 标题、正文、标签都要过审核；返回 `{id,status}`，`status` 为 `published` 或 `pending` |
+| `GET /api/posts` / `GET /api/posts/:id` | `pending` 内容只对作者本人可见，对其他人和未登录返回已发布内容 / 404 |
+| `GET /api/posts/:id/comments` | 未登录只看到已发布评论 |
+| `GET /api/posts/:id/comments/mine` | 登录后带本人视角，自己的待审评论可见 |
+| `POST /api/posts/:id/comments` | 评论过审核并限流；返回 `comment.status` |
+| `PATCH /api/users/me` | 昵称、简介先过文本审核，命中返回 422 |
+| `POST /api/reports` | `{targetType:"post"\|"comment"\|"user",targetId,reason}` → `201 {id,status}`；转发审核服务举报中心，同时本地留痕 365 天 |
+| `DELETE /api/admin/posts/:id` / `DELETE /api/admin/comments/:id` | 必填 `{reason}`，写审计 `admin.post_delete` / `admin.comment_delete` |
+| `PATCH /api/admin/posts/:id/status` | 人工复核后改成 `published` / `pending` / `rejected` |
+| `GET /api/admin/reports` / `PATCH /api/admin/reports/:id` | 查看与处理举报，`{status:"handled"\|"rejected",resolution}` |
+| `GET\|PATCH /api/admin/settings/pre-publish` | 先审后发开关，即时生效 |
+| `GET /api/admin/users/:id/moderation` | 查看封停/禁言状态 |
+| `POST\|DELETE /api/admin/users/:id/ban` / `mute` | 封停、禁言；必填 `{reason}`，写审计 |
+| `GET\|POST\|PATCH\|DELETE /api/admin/moderation/keywords[/:id]` | 转发审核服务词库管理（需 `MODERATION_ADMIN_KEY`） |
+| `GET\|POST\|PATCH\|DELETE /api/admin/moderation/ip-rules[/:id]` | 转发审核服务 IP 规则管理 |
+| `GET /api/admin/moderation/scenes` / `PUT .../scenes/:scene` | 转发按场景的先审后发策略 |
+
+错误码（新增路径）：
+
+| 状态 | errorKey | 含义 |
+| --- | --- | --- |
+| 422 | `moderation.blocked` | 文本命中，带 `categories`，不回显命中词 |
+| 403 | `moderation.ip_blocked` | IP 或地区规则命中 |
+| 503 | `moderation.unavailable` | 审核服务不可用，发布类请求拒绝（failClosed） |
+| 429 | `rate.limited` | 发布过于频繁，带 `retryAfter`（秒） |
+| 403 | `account.banned` / `account.muted` | 账号被封停 / 被禁言，禁止发布 |
+
+发布闸门顺序固定：封停/禁言 → 限流 → IP 规则 → 文本审核 → 先审后发判定。
+限流按用户分别限制发帖与评论（`PUBLISH_RATE_*`、`COMMENT_RATE_*`），计数落库，重启不清零。
 
 成功登录返回 `{token,user}`，其中 `user.id` 是 `user_` 开头的字符串本地 ID，`user.gatewayUserId` 是网关 sub。`user.avatarUrl` 来自网关 `picture`，App 个人页显示该图片。
 受保护 API 使用 `Authorization: Bearer <QFLI token>`。社区、云项目、在线终端 API 保持原路径。
