@@ -8,6 +8,8 @@ const identity = require('../identity');
 const gateway = require('../gateway');
 const { userGrowth } = require('../growth');
 const { createId, isId } = require('../entity-id');
+const moderation = require('../moderation-service');
+const { clientIp } = require('../client-ip');
 
 const router = express.Router();
 
@@ -107,6 +109,10 @@ router.patch('/me', authRequired, async (req, res) => {
     updates.description = bio;
   }
   if (req.body?.avatarColor !== undefined) throw new gateway.ApiError(400, '头像颜色不单独存储，请使用网关头像');
+  // 昵称与简介属于公开内容，必须先过文本审核（命中直接 422）。
+  await moderation.checkProfileFields(req, {
+    nickname: updates.name, bio: updates.description, ip: clientIp(req),
+  });
   const claims = await gateway.updateProfile(await identity.accessToken(req.authSession), updates);
   if (gateway.subject(claims) !== user.gateway_user_id) throw new gateway.ApiError(502, '用户身份不匹配');
   identity.rememberProfile(user.gateway_user_id, claims);

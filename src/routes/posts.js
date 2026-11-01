@@ -5,6 +5,8 @@ const { authOptional, authRequired } = require('../util');
 const { audit } = require('../audit');
 const { author } = require('../identity');
 const { createId } = require('../entity-id');
+const moderation = require('../moderation-service');
+const { clientIp } = require('../client-ip');
 
 const router = express.Router();
 
@@ -38,7 +40,7 @@ router.get('/tags', async (req, res) => {
 
 const POST_SUMMARY_SELECT = `
   SELECT p.id, p.type, p.title, p.content, p.created_at, p.updated_at,
-         p.user_id, u.gateway_user_id,
+         p.user_id, p.status, u.gateway_user_id,
          z.name AS zone_name, z.id AS zone_id,
          (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
          (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
@@ -59,6 +61,7 @@ async function mapSummary(r, userId) {
     id: r.id,
     type: r.type,
     title: r.title,
+    status: r.status || 'published',
     excerpt: r.content.length > 120 ? `${r.content.slice(0, 120)}…` : r.content,
     tags,
     zoneId: r.zone_id,
@@ -79,6 +82,13 @@ router.get('/posts', authOptional, async (req, res) => {
   const pageSize = Math.min(50, Math.max(5, Number(req.query.pageSize) || 20));
   const where = [];
   const params = [];
+  // 先审后发：pending 只对作者本人与管理员可见，其他人只看 published。
+  if (req.userId) {
+    where.push("(p.status = 'published' OR (p.status = 'pending' AND p.user_id = ?))");
+    params.push(req.userId);
+  } else {
+    where.push("p.status = 'published'");
+  }
   if (type === 'tutorial' || type === 'discussion') {
     where.push('p.type = ?');
     params.push(type);
@@ -118,6 +128,9 @@ router.get('/posts/:id', authOptional, async (req, res) => {
     .prepare(`${POST_SUMMARY_SELECT} WHERE p.id = ?`)
     .get(req.params.id);
   if (!row) return res.status(404).json({ error: '内容不存在' });
+  if (row.status !== 'published' && row.user_id !== req.userId) {
+    return res.status(404).json({ error: '内容不存在' });
+  }
   res.json({ post: { ...(await mapSummary(row, req.userId)), content: row.content } });
 });
 
@@ -140,16 +153,26 @@ router.post('/posts', authRequired, async (req, res) => {
     .map((t) => String(t).replace(/^#/, '').trim())
     .filter((t) => t.length > 0 && t.length <= 16)
     .slice(0, 5);
+  // 标题、正文、标签都要过审核；先审后发开启时落库为 pending。
+  const gate = await moderation.publishGate(req, {
+    kind: 'post',
+    ip: clientIp(req),
+    fields: [
+      { scene: 'community.post.title', text: trimmedTitle },
+      { scene: 'community.post.content', text: trimmedContent },
+      ...cleanTags.map((tag) => ({ scene: 'community.post.tag', text: tag })),
+    ],
+  });
   const postId = createId('posts');
   await db
     .prepare(
-      'INSERT INTO posts (id, user_id, type, zone_id, title, content) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT INTO posts (id, user_id, type, zone_id, title, content, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
     )
-    .run(postId, req.userId, type, zone.id, trimmedTitle, trimmedContent);
+    .run(postId, req.userId, type, zone.id, trimmedTitle, trimmedContent, gate.status);
   const insertTag = db.prepare('INSERT INTO post_tags (post_id, tag) VALUES (?, ?)');
   for (const t of cleanTags) await insertTag.run(postId, t);
-  audit(req, { action: 'post.create', target: `post:${postId}`, detail: `${type} ${trimmedTitle}` });
-  res.json({ id: postId });
+  audit(req, { action: 'post.create', target: `post:${postId}`, detail: `${type} ${trimmedTitle} status=${gate.status}` });
+  res.json({ id: postId, status: gate.status });
 });
 
 router.delete('/posts/:id', authRequired, async (req, res) => {

@@ -5,10 +5,18 @@ const { authRequired } = require('../util');
 const { audit } = require('../audit');
 const { author } = require('../identity');
 const { createId } = require('../entity-id');
+const moderation = require('../moderation-service');
+const { clientIp } = require('../client-ip');
 
 const router = express.Router();
 
-async function fetchComments(postId) {
+// 评论可见性：published 公开；pending 只对作者本人与管理员显示。
+function visible(comment, viewer, isAdmin) {
+  if (comment.status === 'pending') return isAdmin || comment.userId === viewer;
+  return comment.status !== 'rejected';
+}
+
+async function fetchComments(postId, viewer = null, isAdmin = false) {
   const rows = await db
     .prepare(
       `SELECT c.*, u.gateway_user_id
@@ -19,19 +27,24 @@ async function fetchComments(postId) {
   const byId = new Map();
   const roots = [];
   for (const r of rows) {
-    byId.set(r.id, {
+    const node = {
       id: r.id,
       content: r.content,
+      status: r.status || 'published',
       createdAt: r.created_at,
       parentId: r.parent_id,
+      userId: r.user_id,
+      isMine: viewer != null && r.user_id === viewer,
       author: await author(r.user_id, r.gateway_user_id),
       children: [],
-    });
+    };
+    byId.set(r.id, node);
   }
   for (const node of byId.values()) {
-    if (node.parentId && byId.has(node.parentId)) {
+    if (!visible(node, viewer, isAdmin)) continue;
+    if (node.parentId && byId.has(node.parentId) && visible(byId.get(node.parentId), viewer, isAdmin)) {
       byId.get(node.parentId).children.push(node);
-    } else {
+    } else if (!node.parentId) {
       roots.push(node);
     }
   }
@@ -45,7 +58,13 @@ async function fetchComments(postId) {
 }
 
 router.get('/posts/:id/comments', async (req, res) => {
+  // 评论列表不强制登录；未登录只看到已发布评论。
   res.json({ items: await fetchComments(req.params.id) });
+});
+
+// 已登录时带上本人视角（自己的待审评论可见）。
+router.get('/posts/:id/comments/mine', authRequired, async (req, res) => {
+  res.json({ items: await fetchComments(req.params.id, req.userId, Boolean(req.user?.is_admin)) });
 });
 
 router.post('/posts/:id/comments', authRequired, async (req, res) => {
@@ -66,12 +85,18 @@ router.post('/posts/:id/comments', authRequired, async (req, res) => {
       return res.status(400).json({ error: '回复目标不存在' });
     }
   }
+  // 评论内容过审核（禁言、限流、IP 规则同样生效）。
+  const gate = await moderation.publishGate(req, {
+    kind: 'comment',
+    ip: clientIp(req),
+    fields: [{ scene: 'community.comment', text }],
+  });
   const commentId = createId('comments');
   await db
     .prepare(
-      'INSERT INTO comments (id, post_id, user_id, parent_id, content) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO comments (id, post_id, user_id, parent_id, content, status) VALUES (?, ?, ?, ?, ?, ?)',
     )
-    .run(commentId, postId, req.userId, parent ? parent.id : null, text);
+    .run(commentId, postId, req.userId, parent ? parent.id : null, text, gate.status);
   const row = await db
     .prepare(
       `SELECT c.*, u.gateway_user_id
@@ -82,6 +107,7 @@ router.post('/posts/:id/comments', authRequired, async (req, res) => {
     comment: {
       id: row.id,
       content: row.content,
+      status: row.status || 'published',
       createdAt: row.created_at,
       parentId: row.parent_id,
       author: await author(row.user_id, row.gateway_user_id),
@@ -91,7 +117,7 @@ router.post('/posts/:id/comments', authRequired, async (req, res) => {
   audit(req, {
     action: 'comment.create',
     target: `post:${postId}${parent ? ` comment:${parent.id}` : ''}`,
-    detail: text.slice(0, 200),
+    detail: `${text.slice(0, 200)} status=${gate.status}`,
   });
 });
 
