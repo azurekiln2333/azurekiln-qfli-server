@@ -6,6 +6,8 @@ const { authRequired, publicUser } = require('../util');
 const { audit } = require('../audit');
 const identity = require('../identity');
 const gateway = require('../gateway');
+const deactivate = require('../deactivate');
+const { RETENTION_DAYS } = require('../audit-retention');
 const { userGrowth } = require('../growth');
 const { createId, isId } = require('../entity-id');
 const moderation = require('../moderation-service');
@@ -122,6 +124,23 @@ router.patch('/me', authRequired, async (req, res) => {
 
 router.get('/me/tasks', authRequired, async (req, res) => {
   res.json(await taskSnapshot(req.userId));
+});
+
+// 永久注销账号：二次确认 + 网关统一账号注销 + 删除本站数据 + 审计去标识化。
+// 未实名账号也必须能注销，因此本路由不在实名门槛的受限前缀里。
+router.post('/me/deactivate', authRequired, async (req, res) => {
+  if (req.body?.confirm !== deactivate.CONFIRM_PHRASE) {
+    throw new gateway.ApiError(400, `注销需要二次确认：请在 confirm 字段提交 ${deactivate.CONFIRM_PHRASE}`);
+  }
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
+  if (!user) throw new gateway.ApiError(404, '用户不存在');
+  if (!user.gateway_user_id) throw new gateway.ApiError(409, '该账号未绑定登录网关，请联系管理员注销');
+  const result = await deactivate.deactivateUser(user);
+  res.json({
+    status: result.status,
+    deactivated: true,
+    retentionDays: RETENTION_DAYS,
+  });
 });
 
 router.get('/me/checkins', authRequired, async (req, res) => {
