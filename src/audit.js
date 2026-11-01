@@ -1,32 +1,31 @@
-// 操作审计：所有敏感操作落库（保留 90 天），写入失败不影响主流程。
+// 操作审计：所有敏感操作落库（保留 365 天），写入失败不影响主流程。
+// 留存期是向公安承诺的口径：src/audit-retention.js 与 db.js 的启动清理同源。
 const db = require('./db');
 const identity = require('./identity');
 const { createId } = require('./entity-id');
+const { clientPlatform } = require('./client-context');
+const { clientIp, clientPort } = require('./client-ip');
+const { anonymize } = require('./anonymize');
+const { RETENTION_DAYS } = require('./audit-retention');
 
-const RETENTION_DAYS = 90;
-
-function clientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.trim().length > 0) {
-    return forwarded.split(',')[0].trim();
-  }
-  return req.socket?.remoteAddress || '';
-}
-
-async function audit(req, { userId, username, action, target, detail }) {
+async function audit(req, { userId, username, action, target, detail, loginType }) {
   try {
     await db.prepare(
-      `INSERT INTO audit_logs (id, user_id, username, action, target, detail, ip, user_agent)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO audit_logs
+         (id, user_id, username, action, target, detail, ip, port, platform, login_type, user_agent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       createId('audit_logs'),
-      userId ?? req.userId ?? null,
-      username ?? req.user?.username ?? null,
+      userId ?? req?.userId ?? null,
+      username ?? req?.user?.username ?? null,
       action,
       target ?? null,
       detail == null ? null : String(detail).slice(0, 2000),
       clientIp(req),
-      String(req.headers['user-agent'] || '').slice(0, 300),
+      clientPort(req),
+      clientPlatform(req),
+      loginType == null ? null : String(loginType).slice(0, 32),
+      String(req?.headers?.['user-agent'] || '').slice(0, 300),
     );
   } catch (err) {
     console.error('[audit] write failed:', err.message);

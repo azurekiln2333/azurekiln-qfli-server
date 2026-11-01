@@ -38,11 +38,13 @@ function verificationFields(body) {
   };
 }
 
-async function loginResponse(req, res, result, action) {
+async function loginResponse(req, res, result, action, loginType) {
   stage('qfli.create_session');
   const session = await identity.createSession(result.tokens, result.claims);
   stage('qfli.login_audit');
-  await audit(req, { userId: session.user.id, username: result.claims.preferred_username, action });
+  await audit(req, {
+    userId: session.user.id, username: result.claims.preferred_username, action, loginType,
+  });
   stage('qfli.login_response');
   res.json({
     token: signToken({ uid: session.user.id, sid: session.id }),
@@ -62,7 +64,7 @@ router.post('/login', async (req, res) => {
   const password = text(req.body, 'password', 72);
   if (Buffer.byteLength(password, 'utf8') > 72) throw new gateway.ApiError(400, '密码不能超过 72 字节');
   const result = await gateway.authorize('password', { username, password, ...verificationFields(req.body) }, req);
-  await loginResponse(req, res, result, 'auth.password_login');
+  await loginResponse(req, res, result, 'auth.password_login', 'password');
 });
 
 router.post('/huawei', async (req, res) => {
@@ -80,7 +82,7 @@ router.post('/huawei', async (req, res) => {
     huaweiChallenges.set(challengeId, { ...result, createdAt: Date.now() });
     throw new gateway.ApiError(428, '请输入登录验证码', { challengeId, factor: result.pending.factor, emailMasked: result.pending.email });
   }
-  await loginResponse(req, res, result, 'auth.huawei_login');
+  await loginResponse(req, res, result, 'auth.huawei_login', 'huawei_login');
 });
 
 function huaweiBinding(body) {
@@ -91,6 +93,13 @@ function huaweiBinding(body) {
     throw new gateway.ApiError(400, '绑定请求已过期，请重新发起华为登录');
   }
   if (entry.inProgress) throw new gateway.ApiError(409, '正在处理绑定请求，请稍候');
+  // 没有已验证手机号的华为账号无法完成实名，不允许跳过绑定直接建号。
+  if (entry.phoneAvailable === false) {
+    huaweiBindings.delete(bindingId);
+    throw new gateway.ApiError(403, '请使用已绑定手机号的华为账号', {
+      errorKey: 'realname.phone_required',
+    });
+  }
   entry.inProgress = true;
   return { bindingId, entry };
 }
@@ -106,7 +115,7 @@ router.post('/huawei/skip', async (req, res) => {
       huaweiChallenges.set(challengeId, { ...result, createdAt: Date.now() });
       throw new gateway.ApiError(428, '请输入登录验证码', { challengeId, factor: result.pending.factor, emailMasked: result.pending.email });
     }
-    await loginResponse(req, res, result, 'auth.huawei_login');
+    await loginResponse(req, res, result, 'auth.huawei_login', 'huawei_skip');
   } finally { entry.inProgress = false; }
 });
 
@@ -118,7 +127,7 @@ router.post('/huawei/bind', async (req, res) => {
     if (Buffer.byteLength(password, 'utf8') > 72) throw new gateway.ApiError(400, '密码不能超过 72 字节');
     const result = await gateway.bindHuawei(entry, { username, password, ...verificationFields(req.body) }, req);
     huaweiBindings.delete(bindingId);
-    await loginResponse(req, res, result, 'auth.huawei_bind');
+    await loginResponse(req, res, result, 'auth.huawei_bind', 'huawei_bind');
   } finally { entry.inProgress = false; }
 });
 
@@ -132,7 +141,7 @@ router.post('/huawei/complete', async (req, res) => {
   try {
     const result = await gateway.completeHuawei(entry, code);
     huaweiChallenges.delete(challengeId);
-    await loginResponse(req, res, result, 'auth.huawei_login');
+    await loginResponse(req, res, result, 'auth.huawei_login', 'huawei_mfa');
   } finally { entry.inProgress = false; }
 });
 
@@ -158,12 +167,15 @@ router.post('/register', async (req, res) => {
     username, email, password, confirm_password: password,
     name: text(req.body, 'nickname', 64, false) || username, ...verificationFields(req.body), email_code: emailCode,
   });
-  await audit(req, { username, action: 'auth.register' });
+  await audit(req, { username, action: 'auth.register', loginType: 'register' });
   res.json(result);
 });
 
 router.post('/logout', authRequired, async (req, res) => {
   await db.prepare('DELETE FROM auth_sessions WHERE id = ?').run(req.authSession.id);
+  await audit(req, {
+    userId: req.userId, username: req.user.username, action: 'auth.logout', loginType: 'logout',
+  });
   res.json({ ok: true });
 });
 
@@ -201,7 +213,7 @@ router.post('/oauth2/complete', async (req, res) => {
   if (!entry || Date.now() - entry.createdAt >= TTL_MS) throw new gateway.ApiError(400, '登录码无效或已过期');
   loginCodes.delete(code);
   entry.claims = await gateway.userinfo(entry.tokens.access_token);
-  await loginResponse(req, res, entry, 'auth.oauth2_login');
+  await loginResponse(req, res, entry, 'auth.oauth2_login', 'oauth2');
 });
 
 module.exports = router;
