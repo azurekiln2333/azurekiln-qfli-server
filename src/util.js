@@ -79,6 +79,15 @@ async function authOptional(req, _res, next) {
 }
 
 async function authRequired(req, res, next) {
+  // 实名中间件已解析过同一请求的会话时直接复用，避免一次请求两次访问网关。
+  if (req.authSession && req.gatewayClaims && req.userId) {
+    req.user = {
+      id: req.userId, gateway_user_id: req.authSession.gateway_user_id,
+      username: req.gatewayClaims.preferred_username || req.gatewayClaims.username || '',
+      is_admin: req.gatewayClaims.isAdmin === true || req.gatewayClaims.role === 'admin',
+    };
+    return next();
+  }
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   const payload = token ? verifyToken(token) : null;
