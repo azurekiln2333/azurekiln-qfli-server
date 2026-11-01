@@ -1,0 +1,70 @@
+# Image-only business stack. Pull the published image; never build on the server.
+# Host networking keeps the existing MySQL (127.0.0.1), practice MySQL socket and
+# executor URL settings working unchanged. The business container never receives
+# a Docker socket. Update scope `qfli-server` is independent of the terminal stack.
+services:
+  server:
+    image: "${QFLI_SERVER_IMAGE:-docker.cnb.cool/azurekiln/qflistudio-next/qfli-server:latest}"
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    user: "${QFLI_SERVER_UID:-1000}:${QFLI_SERVER_GID:-1000}"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "${PORT:-3000}"
+      QFLI_DATA_DIR: /app/data
+      HOME: /tmp
+    volumes:
+      - ./data:/app/data
+      # Uncomment only when the practice MySQL socket lives on this host.
+      # - /run/qfli-sqlbox:/run/qfli-sqlbox
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: "${QFLI_SERVER_MEMORY:-512m}"
+    cpus: "${QFLI_SERVER_CPUS:-1.0}"
+    pids_limit: 256
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: qfli-server
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 6s
+      start_period: 30s
+      retries: 3
+
+  # Independent updater for the business image only. This is the one process
+  # that holds the host Docker socket; the business container never mounts it.
+  watchtower:
+    image: "${QFLI_SERVER_WATCHTOWER_IMAGE:-nickfedor/watchtower:1.23.2}"
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_SCOPE: qfli-server
+      WATCHTOWER_POLL_INTERVAL: "${WATCHTOWER_POLL_INTERVAL:-600}"
+      WATCHTOWER_CLEANUP: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      com.centurylinklabs.watchtower.scope: qfli-server
+    mem_limit: 64m
+    cpus: "0.10"
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

@@ -1,0 +1,15 @@
+*** Begin Patch
+*** Update File: D:/MyNewWebProjects/azurekiln-oauth2/server.js
+@@
+-      name: user.name, preferred_username: user.username, username: user.username, picture: user.avatar,
++      name: user.name, preferred_username: user.username, username: user.username, picture: user.avatar,
++      description: user.description || '',
+@@
+-app.get('/oauth2/userinfo', asyncHandler(async (req, res) => {
++require('./services/qfli-integration')({
++  app, asyncHandler, authenticateClient, validateToken, getModels: () => ({ Token, Client, User }),
++  isClientActive, isUserBanned, scopedUserClaims,
++});
++
++app.get('/oauth2/userinfo', asyncHandler(async (req, res) => {
+*** End Patch

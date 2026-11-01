@@ -1,0 +1,17 @@
+{
+  "name": "azurekiln-qfli-server",
+  "version": "1.0.0",
+  "description": "QFLIStudio+ community & online terminal server",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "link-user": "node --env-file-if-exists=.env scripts/link-user.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "mysql2": "^3.24.4"
+  }
+}

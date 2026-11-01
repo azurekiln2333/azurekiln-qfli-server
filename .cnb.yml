@@ -1,0 +1,99 @@
+# CI for the standalone business backend repository.
+# Image namespace follows the CNB rule docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}/<name>.
+# `services: [docker]` logs in automatically on trusted push/tag pipelines.
+# Pull requests validate only; they never push images.
+
+main:
+  push:
+    - name: verify
+      docker: &node-runtime
+        image: node:24.15.0-bookworm
+      stages:
+        - name: unit-tests
+          script: |
+            set -euo pipefail
+            node --version
+            npm ci
+            node scripts/check-deployment.mjs
+            node --test test/*.test.js
+            for script in deployment/sqlbox/bootstrap.sh; do
+              bash -n "$script"
+            done
+    - name: publish-image
+      docker:
+        image: cnbcool/default-dev-env:latest
+      services:
+        - docker
+      stages:
+        - name: build-and-push
+          script: |
+            set -euo pipefail
+            # Validate before publishing: a failing test must block the image.
+            command -v node >/dev/null || { echo 'node is required in the publish image' >&2; exit 1; }
+            npm ci
+            node scripts/check-deployment.mjs
+            node --test test/*.test.js
+            REGISTRY="${CNB_REGISTRY:-docker.cnb.cool}"
+            SLUG="${CNB_REPO_SLUG_LOWERCASE:?CNB_REPO_SLUG_LOWERCASE is not set}"
+            IMAGE="${CNB_IMAGE:-$REGISTRY/$SLUG/qfli-server}"
+            REVISION="${CNB_COMMIT_SHORT:-$(git rev-parse --short HEAD)}"
+            if [ -n "${CNB_REGISTRY_PASSWORD:-}" ]; then
+              printf '%s' "$CNB_REGISTRY_PASSWORD" |
+                docker login "$REGISTRY" -u "${CNB_REGISTRY_USER:-cnb}" --password-stdin
+            fi
+            docker build --pull -t "$IMAGE:$REVISION" .
+            docker push "$IMAGE:$REVISION"
+            docker tag "$IMAGE:$REVISION" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+            printf 'published %s:%s and %s:latest\n' "$IMAGE" "$REVISION" "$IMAGE"
+
+  pull_request:
+    - name: verify-pull-request
+      docker: *node-runtime
+      stages:
+        - name: unit-tests
+          script: |
+            set -euo pipefail
+            npm ci
+            node scripts/check-deployment.mjs
+            node --test test/*.test.js
+            for script in deployment/sqlbox/bootstrap.sh; do
+              bash -n "$script"
+            done
+
+"v*":
+  tag_push:
+    - name: publish-release-image
+      docker:
+        image: cnbcool/default-dev-env:latest
+      services:
+        - docker
+      stages:
+        - name: build-and-push-tag
+          script: |
+            set -euo pipefail
+            command -v node >/dev/null || { echo 'node is required in the publish image' >&2; exit 1; }
+            npm ci
+            node scripts/check-deployment.mjs
+            node --test test/*.test.js
+            REGISTRY="${CNB_REGISTRY:-docker.cnb.cool}"
+            SLUG="${CNB_REPO_SLUG_LOWERCASE:?CNB_REPO_SLUG_LOWERCASE is not set}"
+            IMAGE="${CNB_IMAGE:-$REGISTRY/$SLUG/qfli-server}"
+            TAG="${CNB_BRANCH:?CNB_BRANCH is not set}"
+            VERSION="${TAG#v}"
+            STABLE=0
+            case "$VERSION" in
+              *-*) echo "prerelease $VERSION, floating tags stay unchanged" ;;
+              *) STABLE=1 ;;
+            esac
+            if [ -n "${CNB_REGISTRY_PASSWORD:-}" ]; then
+              printf '%s' "$CNB_REGISTRY_PASSWORD" |
+                docker login "$REGISTRY" -u "${CNB_REGISTRY_USER:-cnb}" --password-stdin
+            fi
+            docker build --pull -t "$IMAGE:$TAG" .
+            docker push "$IMAGE:$TAG"
+            if [ "$STABLE" = 1 ]; then
+              docker tag "$IMAGE:$TAG" "$IMAGE:latest"
+              docker push "$IMAGE:latest"
+            fi
+            printf 'published %s:%s (stable=%s)\n' "$IMAGE" "$TAG" "$STABLE"
