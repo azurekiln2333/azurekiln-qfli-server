@@ -15,11 +15,14 @@ const auditRoutes = require('./routes/audit');
 const cloudRoutes = require('./routes/cloud');
 const sqlRoutes = require('./routes/sql');
 const aiRoutes = require('./routes/ai');
+const reportRoutes = require('./routes/reports');
+const moderationAdminRoutes = require('./routes/moderation-admin');
 const { ApiError } = require('./gateway');
+const { realnameRequired } = require('./client-context');
 const { log, requestContext } = require('./logging');
 
 // Express 4 does not forward rejected route/middleware promises automatically.
-for (const router of [authRoutes, userRoutes, postRoutes, commentRoutes, terminalRoutes, auditRoutes, cloudRoutes, sqlRoutes, aiRoutes]) {
+for (const router of [authRoutes, userRoutes, postRoutes, commentRoutes, terminalRoutes, auditRoutes, cloudRoutes, sqlRoutes, aiRoutes, reportRoutes, moderationAdminRoutes]) {
   for (const layer of router.stack) {
     for (const handler of layer.route ? layer.route.stack : [layer]) {
       const original = handler.handle;
@@ -59,13 +62,17 @@ app.get('/api/health', (_req, res) =>
 
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
-app.use('/api', postRoutes);
-app.use('/api', commentRoutes);
-app.use('/api/terminal', terminalRoutes);
-app.use('/api/sql', sqlRoutes);
-app.use('/api', cloudRoutes);
+// 实名门槛：没有已验证手机号时，以下联网服务一律 403 realname.required。
+// 只挂在挂载层，不改业务路由内部；/api/users（含注销）与 /api/auth 不在此列。
+app.use('/api', realnameRequired, postRoutes);
+app.use('/api', realnameRequired, commentRoutes);
+app.use('/api/terminal', realnameRequired, terminalRoutes);
+app.use('/api/sql', realnameRequired, sqlRoutes);
+app.use('/api', realnameRequired, cloudRoutes);
 app.use('/api', auditRoutes);
-app.use('/api/ai', aiRoutes);
+app.use('/api', realnameRequired, reportRoutes);
+app.use('/api/admin', moderationAdminRoutes);
+app.use('/api/ai', realnameRequired, aiRoutes);
 
 // 统一错误处理：不让异常拖垮进程。
 app.use((err, req, res, _next) => {
