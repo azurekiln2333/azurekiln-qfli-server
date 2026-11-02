@@ -3,6 +3,8 @@
 const db = require('./db');
 const client = require('./moderation-client');
 const publishRate = require('./publish-rate');
+const subject = require('./moderation-subject');
+const { log } = require('./logging');
 const { ApiError } = require('./gateway');
 
 const PRE_PUBLISH_KEY = 'pre_publish';
@@ -66,6 +68,11 @@ async function setAccountState(userId, { banned, muted, reason, actorId }) {
 // ---- W1 调用封装 ----
 
 function unavailable(err) {
+  // 身份假名未配置：只能是服务端配置问题，告警一次并拒绝，不回退成原始ID。
+  if (err && err.code === 'moderation.subject_salt_missing') {
+    log('moderation.subject_salt_missing', { env: subject.ENV_NAME }, 'error');
+    return new ApiError(503, '审核服务暂不可用', { errorKey: 'moderation.unavailable' });
+  }
   const message = err instanceof client.ModerationUnavailableError && err.message !== '审核服务暂不可用'
     ? err.message
     : '审核服务暂不可用';
@@ -83,7 +90,10 @@ async function checkText({ scene, text, userId, ip }) {
   if (typeof text !== 'string' || text.trim() === '') return { decision: 'pass', categories: [] };
   let result;
   try {
-    result = await client.call('checkText', { scene, text, userId, ip });
+    // 送给审核服务的只能是假名：原ID会在审核侧留存 365 天。
+    result = await client.call('checkText', {
+      scene, text, ip, userId: subject.requirePseudonym(userId),
+    });
   } catch (err) {
     if (err instanceof ApiError) throw err;
     throw unavailable(err);
@@ -98,7 +108,9 @@ async function checkIp({ ip, userId, scene }) {
   if (!ip) return { blocked: false };
   let result;
   try {
-    result = await client.call('checkIp', { ip, userId, scene });
+    result = await client.call('checkIp', {
+      ip, scene, userId: subject.requirePseudonym(userId),
+    });
   } catch (err) {
     if (err instanceof ApiError) throw err;
     throw unavailable(err);
@@ -160,7 +172,13 @@ async function checkProfileFields(req, { nickname, bio, ip }) {
 // ---- 举报转发 ----
 
 async function forwardReport({ targetType, targetId, reporterId, reason }) {
-  const result = await client.call('submitReport', { targetType, targetId, reporterId, reason });
+  // reporterId 一律假名化；目标是被举报用户时，其ID也不能原样送出。
+  const result = await client.call('submitReport', {
+    targetType,
+    targetId: targetType === 'user' ? subject.requirePseudonym(targetId) : targetId,
+    reporterId: subject.requirePseudonym(reporterId),
+    reason,
+  });
   return { id: typeof result?.id === 'string' ? result.id : null };
 }
 
