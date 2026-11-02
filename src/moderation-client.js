@@ -1,16 +1,18 @@
 // W1 公共审核服务的传输层（QFLI 侧）。业务只经 moderation-service 调用本文件。
 // 契约唯一来源：D:/MyNewProjects/azurekiln-moderation/README.md（v1）。
-// 判定逻辑（规范化、词库、IP 规则、企业策略）全部在 W1，本文件只做契约映射与超时。
+// 审核判定（规范化、词库、IP 规则、人工队列）全部在 W1 服务里，本文件只做参数整形与错误映射。
 //
-// 三种传输实现，优先级从高到低：
-//   1. 测试注入（__setTransport）
-//   2. 已安装 @azurekiln/moderation-client（W1 packages/client，见 README 的 Node SDK contract）
-//   3. MODERATION_BASE_URL 直连 HTTP（同一契约，作为 SDK 未就绪前的等价实现）
+// 传输实现：
+//   1. 测试注入（__setTransport）—— 只给单测用，生产不会走到
+//   2. @azurekiln/moderation-client（vendor/ 下的 tgz，任务书要求审核只通过 SDK 接入）
 //
-// 未配置且未安装时抛 ModerationUnavailableError，由上层按 failClosed 处理。
+// SDK 缺失或未配置时抛 ModerationUnavailableError，由上层按 failClosed 处理。
+// 管理接口（词库、IP 规则、场景开关）：SDK 0.1.0 没有暴露这些方法，
+// 因此用同一套 X-App-Id + Bearer 契约直接调用，凭据仍是服务端的 MODERATION_ADMIN_KEY。
 
 const SERVICE_NAME = '@azurekiln/moderation-client';
 const UNAVAILABLE_MESSAGE = '审核服务暂不可用';
+const CHECK_DECISIONS = new Set(['pass', 'block', 'review']);
 
 class ModerationUnavailableError extends Error {
   constructor(message = UNAVAILABLE_MESSAGE) {
@@ -21,18 +23,15 @@ class ModerationUnavailableError extends Error {
   }
 }
 
-const CHECK_DECISIONS = new Set(['pass', 'block', 'review']);
-
 let transport = null;      // 测试注入的实现
-let sdkClient = null;      // W1 SDK 实例（惰性加载）
+let sdkClient = null;      // SDK 实例（惰性创建）
 let sdkLoaded = false;
 
 function settings() {
   return {
     baseUrl: (process.env.MODERATION_BASE_URL || '').trim().replace(/\/+$/, ''),
     appId: (process.env.MODERATION_APP_ID || '').trim(),
-    // README 用 MODERATION_API_KEY；保留 MODERATION_APP_SECRET 作为旧名兼容。
-    apiKey: (process.env.MODERATION_API_KEY || process.env.MODERATION_APP_SECRET || '').trim(),
+    apiKey: (process.env.MODERATION_API_KEY || '').trim(),
     // /v1/admin/* 需要 app 自己的 admin key。
     adminKey: (process.env.MODERATION_ADMIN_KEY || '').trim(),
     timeoutMs: Math.min(30000, Math.max(500, Number(process.env.MODERATION_TIMEOUT_MS) || 3000)),
@@ -50,14 +49,11 @@ function loadSdk() {
   const cfg = settings();
   if (!configured()) return null;
   try {
-    // 可选依赖：未安装时走直连 HTTP（同契约）。
-    // eslint-disable-next-line import/no-dynamic-require
-    const mod = require(SERVICE_NAME);
-    sdkClient = new mod.ModerationClient({
+    const { ModerationClient } = require(SERVICE_NAME);
+    sdkClient = new ModerationClient({
       baseUrl: cfg.baseUrl,
       appId: cfg.appId,
       apiKey: cfg.apiKey,
-      adminKey: cfg.adminKey || undefined,
       timeoutMs: cfg.timeoutMs,
       failClosed: true,
     });
@@ -67,54 +63,7 @@ function loadSdk() {
   return sdkClient;
 }
 
-async function httpRequest(method, path, body, { admin = false } = {}) {
-  const cfg = settings();
-  if (!cfg.baseUrl || !cfg.appId || !cfg.apiKey) throw new ModerationUnavailableError();
-  if (admin && !cfg.adminKey) throw new ModerationUnavailableError('审核管理接口未配置');
-  let endpoint;
-  try {
-    endpoint = new URL(`${cfg.baseUrl}${path}`);
-  } catch (_) {
-    throw new ModerationUnavailableError();
-  }
-  // 与网关一致的传输约束：只允许证书有效的 HTTPS（本机开发可用回环 HTTP）。
-  if (endpoint.protocol !== 'https:' &&
-      !(endpoint.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname))) {
-    throw new ModerationUnavailableError();
-  }
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method,
-      headers: {
-        'content-type': 'application/json',
-        'x-app-id': cfg.appId,
-        authorization: `Bearer ${admin ? cfg.adminKey : cfg.apiKey}`,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      redirect: 'error',
-      signal: AbortSignal.timeout(cfg.timeoutMs),
-    });
-  } catch (_) {
-    throw new ModerationUnavailableError();
-  }
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    // 契约：4xx 是契约错误，503 是依赖不可用。业务侧一律当作不可用（failClosed），
-    // 但把状态码带上，便于日志区分。
-    const error = new ModerationUnavailableError();
-    error.status = response.status;
-    error.remoteError = typeof data?.error === 'string' ? data.error.slice(0, 64) : undefined;
-    error.requestId = typeof data?.requestId === 'string' ? data.requestId.slice(0, 64) : undefined;
-    throw error;
-  }
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new ModerationUnavailableError();
-  }
-  return data;
-}
-
-// 检查结果必须带合法 decision，否则按不可用处理（README：invalid check responses）。
+// SDK 校验过的检查结果再做一次形状收敛，保证上层只看到三种 decision。
 function validateCheck(result) {
   if (!result || typeof result !== 'object' || !CHECK_DECISIONS.has(result.decision)) {
     throw new ModerationUnavailableError();
@@ -129,30 +78,49 @@ function validateCheck(result) {
   };
 }
 
+const CHECK_OPERATIONS = new Set(['checkText', 'checkIp', 'checkImage']);
+
 async function call(operation, payload) {
   if (transport) return transport(operation, payload);
   const sdk = loadSdk();
-  if (sdk && typeof sdk[operation] === 'function') {
+  if (!sdk) throw new ModerationUnavailableError();
+  if (CHECK_OPERATIONS.has(operation)) {
     let result;
     try {
-      result = await sdk[operation](payload);
+      result = await sdk[operation](checkInput(operation, payload));
     } catch (err) {
+      // SDK 的 failClosed 已经把不可用统一成 moderation.unavailable，这里只做归一。
       if (err && (err.code === 'moderation.unavailable' || err.name === 'ModerationUnavailableError')) {
         throw new ModerationUnavailableError();
       }
-      throw err;
+      // 4xx 是契约错误（如参数非法），对业务同样意味着无法确认审核通过，按不可用处理。
+      throw new ModerationUnavailableError();
     }
-    if (operation === 'checkText' || operation === 'checkIp' || operation === 'checkImage') {
-      return validateCheck(result);
-    }
-    return result;
-  }
-  const [method, path, body, options] = httpCall(operation, payload || {});
-  const result = await httpRequest(method, path, body, options);
-  if (operation === 'checkText' || operation === 'checkIp' || operation === 'checkImage') {
     return validateCheck(result);
   }
-  return result;
+  if (operation === 'submitReport') return sdk.submitReport(payload);
+  return adminCall(operation, payload || {});
+}
+
+// SDK 只接受契约里的字段，多余字段不要透传。
+function checkInput(operation, payload) {
+  if (operation === 'checkText') {
+    return trim({
+      scene: payload.scene, text: payload.text, userId: payload.userId,
+      ip: payload.ip, targetType: payload.targetType, targetId: payload.targetId,
+    });
+  }
+  if (operation === 'checkImage') {
+    return trim({
+      scene: payload.scene, imageUrl: payload.imageUrl, userId: payload.userId,
+      targetType: payload.targetType, targetId: payload.targetId,
+    });
+  }
+  return trim({ scene: payload.scene, ip: payload.ip, userId: payload.userId });
+}
+
+function trim(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined && v !== null));
 }
 
 function query(params) {
@@ -165,47 +133,68 @@ function query(params) {
   return text ? `?${text}` : '';
 }
 
-function httpCall(operation, payload) {
+// 管理接口走 admin key。SDK 0.1.0 未覆盖，等 SDK 补齐后替换这一层即可，调用方签名不变。
+async function adminCall(operation, payload) {
+  const cfg = settings();
+  if (!cfg.baseUrl || !cfg.appId || !cfg.adminKey) throw new ModerationUnavailableError();
+  const [method, path, body] = adminHttpCall(operation, payload);
+  let endpoint;
+  try {
+    endpoint = new URL(`${cfg.baseUrl}${path}`);
+  } catch (_) {
+    throw new ModerationUnavailableError();
+  }
+  if (endpoint.protocol !== 'https:' &&
+      !(endpoint.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname))) {
+    throw new ModerationUnavailableError();
+  }
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method,
+      headers: {
+        'content-type': 'application/json',
+        'x-app-id': cfg.appId,
+        authorization: `Bearer ${cfg.adminKey}`,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: 'error',
+      signal: AbortSignal.timeout(cfg.timeoutMs),
+    });
+  } catch (_) {
+    throw new ModerationUnavailableError();
+  }
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data || typeof data !== 'object' || Array.isArray(data)) {
+    const error = new ModerationUnavailableError();
+    if (typeof data?.requestId === 'string') error.requestId = data.requestId.slice(0, 64);
+    throw error;
+  }
+  return data;
+}
+
+function adminHttpCall(operation, payload) {
   switch (operation) {
-    case 'checkText':
-      return ['POST', '/v1/text/check', {
-        scene: payload.scene, text: payload.text,
-        userId: payload.userId, ip: payload.ip,
-        targetType: payload.targetType, targetId: payload.targetId,
-      }];
-    case 'checkImage':
-      return ['POST', '/v1/image/check', {
-        scene: payload.scene, imageUrl: payload.imageUrl,
-        userId: payload.userId, targetType: payload.targetType, targetId: payload.targetId,
-      }];
-    case 'checkIp':
-      return ['POST', '/v1/ip/check', { scene: payload.scene, ip: payload.ip, userId: payload.userId }];
-    case 'submitReport':
-      return ['POST', '/v1/reports', {
-        targetType: payload.targetType, targetId: payload.targetId,
-        reporterId: payload.reporterId, reason: payload.reason,
-      }];
-    // 管理接口（app admin key）。QFLI 只做转发，不落任何词库或规则。
     case 'listKeywords':
-      return ['GET', `/v1/admin/keywords${query({ limit: payload.limit, offset: payload.offset, category: payload.category })}`, undefined, { admin: true }];
+      return ['GET', `/v1/admin/keywords${query({ limit: payload.limit, offset: payload.offset, category: payload.category })}`, undefined];
     case 'createKeyword':
-      return ['POST', '/v1/admin/keywords', { word: payload.word, category: payload.category, enabled: payload.enabled }, { admin: true }];
+      return ['POST', '/v1/admin/keywords', trim({ word: payload.word, category: payload.category, enabled: payload.enabled })];
     case 'updateKeyword':
-      return ['PATCH', `/v1/admin/keywords/${encodeURIComponent(payload.id)}`, payload.patch, { admin: true }];
+      return ['PATCH', `/v1/admin/keywords/${encodeURIComponent(payload.id)}`, payload.patch];
     case 'deleteKeyword':
-      return ['DELETE', `/v1/admin/keywords/${encodeURIComponent(payload.id)}`, undefined, { admin: true }];
+      return ['DELETE', `/v1/admin/keywords/${encodeURIComponent(payload.id)}`, undefined];
     case 'listIpRules':
-      return ['GET', `/v1/admin/ip-rules${query({ limit: payload.limit, offset: payload.offset })}`, undefined, { admin: true }];
+      return ['GET', `/v1/admin/ip-rules${query({ limit: payload.limit, offset: payload.offset })}`, undefined];
     case 'createIpRule':
-      return ['POST', '/v1/admin/ip-rules', payload.rule, { admin: true }];
+      return ['POST', '/v1/admin/ip-rules', payload.rule];
     case 'updateIpRule':
-      return ['PATCH', `/v1/admin/ip-rules/${encodeURIComponent(payload.id)}`, payload.patch, { admin: true }];
+      return ['PATCH', `/v1/admin/ip-rules/${encodeURIComponent(payload.id)}`, payload.patch];
     case 'deleteIpRule':
-      return ['DELETE', `/v1/admin/ip-rules/${encodeURIComponent(payload.id)}`, undefined, { admin: true }];
+      return ['DELETE', `/v1/admin/ip-rules/${encodeURIComponent(payload.id)}`, undefined];
     case 'listScenes':
-      return ['GET', '/v1/admin/scenes', undefined, { admin: true }];
+      return ['GET', '/v1/admin/scenes', undefined];
     case 'putScene':
-      return ['PUT', `/v1/admin/scenes/${encodeURIComponent(payload.scene)}`, { preReview: payload.preReview }, { admin: true }];
+      return ['PUT', `/v1/admin/scenes/${encodeURIComponent(payload.scene)}`, { preReview: payload.preReview }];
     default:
       throw new ModerationUnavailableError();
   }

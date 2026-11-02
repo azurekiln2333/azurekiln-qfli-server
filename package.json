@@ -10,6 +10,7 @@
     "link-user": "node --env-file-if-exists=.env scripts/link-user.js"
   },
   "dependencies": {
+    "@azurekiln/moderation-client": "file:vendor/azurekiln-moderation-client-0.1.0.tgz",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "mysql2": "^3.24.4"

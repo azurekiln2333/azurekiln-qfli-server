@@ -7,7 +7,9 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HOME=/tmp
 
+# 审核 SDK 以 tgz 形式 vendor，npm ci 需要它在构建上下文里。
 COPY package.json package-lock.json ./
+COPY vendor ./vendor
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY src ./src
