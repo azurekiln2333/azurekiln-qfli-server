@@ -135,7 +135,22 @@ router.post('/me/deactivate', authRequired, async (req, res) => {
   const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
   if (!user) throw new gateway.ApiError(404, '用户不存在');
   if (!user.gateway_user_id) throw new gateway.ApiError(409, '该账号未绑定登录网关，请联系管理员注销');
-  const result = await deactivate.deactivateUser(user);
+  let result;
+  try {
+    result = await deactivate.deactivateUser(user);
+  } catch (err) {
+    // 网关注销失败时本地数据与会话保留（设计如此）。
+    // 必须留一条失败审计，否则事后无法证明用户曾发起过注销。
+    await audit(req, {
+      userId: req.userId,
+      username: req.user.username,
+      action: 'user.deactivate_failed',
+      target: `user:${req.userId}`,
+      detail: `status=${err.status ?? 500} ` +
+        `errorKey=${typeof err.details?.errorKey === 'string' ? err.details.errorKey : 'unknown'}`,
+    });
+    throw err;
+  }
   res.json({
     status: result.status,
     deactivated: true,

@@ -47,11 +47,15 @@ async function eraseGatewayAccount({ gatewayUserId, requestId }) {
   if (response.ok) return data || {};
   if (response.status === 404 && data?.error === 'user_not_found') return { status: 'already_deleted' };
   // 400/401/403/409/500 都不可安全地继续：本地数据保留，用户可重试。
+  // 把网关的错误写进 details，注销失败审计才能记下具体原因。
+  const remoteError = typeof data?.error === 'string' && /^[a-zA-Z0-9_.-]{1,64}$/.test(data.error)
+    ? data.error : 'gateway_error';
   throw new gateway.ApiError(
     [400, 401, 403, 409, 429].includes(response.status) ? response.status : 502,
     typeof data?.error_description === 'string'
       ? data.error_description.slice(0, 200)
       : '登录网关拒绝了注销请求，请稍后重试',
+    { errorKey: `gateway.${remoteError}` },
   );
 }
 
@@ -109,16 +113,27 @@ async function deleteUserRows(tx, userId) {
 }
 
 // 审计留存 365 天，但个人标识去标识化：action/target/时间/IP/端口/平台保留。
+// 覆盖两类行：该用户作为主体的（user_id），以及该用户作为处置对象的（target 里带 user:<id>）。
+// 只有主体是本人时才改 user_id，管理员处置记录的 user_id 仍指向管理员自己。
 async function deidentifyAudit(tx, userId) {
   const anonymized = `deleted_${anonymize(userId)}`;
-  const rows = await tx.prepare('SELECT id, target, detail FROM audit_logs WHERE user_id = ?').all(userId);
+  const rows = await tx.prepare(
+    'SELECT id, user_id, target, detail FROM audit_logs WHERE user_id = ? OR target LIKE ?',
+  ).all(userId, `%${userId}%`);
   for (const row of rows) {
     // target 与 detail 里可能出现 user_ 前缀的 ID，一并替换。
     const scrub = (value) => (typeof value === 'string' && value.includes(userId)
       ? value.split(userId).join(anonymized)
       : value);
+    const subject = row.user_id === userId ? anonymized : row.user_id;
+    const username = row.user_id === userId ? null : undefined;
+    if (username === undefined) {
+      await tx.prepare('UPDATE audit_logs SET target = ?, detail = ? WHERE id = ?')
+        .run(scrub(row.target), scrub(row.detail), row.id);
+      continue;
+    }
     await tx.prepare('UPDATE audit_logs SET user_id = ?, username = NULL, target = ?, detail = ? WHERE id = ?')
-      .run(anonymized, scrub(row.target), scrub(row.detail), row.id);
+      .run(subject, scrub(row.target), scrub(row.detail), row.id);
   }
   return anonymized;
 }
