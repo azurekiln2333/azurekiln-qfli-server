@@ -4,6 +4,7 @@ const db = require('../db');
 const gateway = require('../gateway');
 const identity = require('../identity');
 const { signToken, authRequired } = require('../util');
+const { createUserId } = require('../user-id');
 const { audit } = require('../audit');
 const { stage } = require('../logging');
 
@@ -167,17 +168,33 @@ router.post('/register', async (req, res) => {
     name: text(req.body, 'nickname', 64, false) || username, ...verificationFields(req.body), email_code: emailCode,
   });
   // 验收第 1 条要求注册日志也带用户ID。注册接口已把账号建在网关上，
-  // 这里用同一套客户端凭据从网关公开资料取 sub，再映射到本地 users 行。
-  // 取不到时保留 null，不假造 ID。
+  // 首次注册时本地还没有 users 行，因此这里要主动建立映射，不能只查。
+  // 取不到网关上 sub 时保留 null，不假造 ID。
   const gatewayUserId = await registeredGatewayUser(username);
-  const registered = gatewayUserId
-    ? await db.prepare('SELECT id FROM users WHERE gateway_user_id = ?').get(gatewayUserId).catch(() => null)
+  const registeredId = gatewayUserId
+    ? await ensureLocalUser(gatewayUserId).catch(() => null)
     : null;
   await audit(req, {
-    userId: registered?.id ?? null, username, action: 'auth.register', loginType: 'register',
+    userId: registeredId, username, action: 'auth.register', loginType: 'register',
   });
   res.json(result);
 });
+
+// 首次注册：网关已有账号，本地 users 行通常在首次登录时才建。
+// 注册日志要求带用户ID，所以这里按网关 sub 补建，并发时回退到已有行。
+async function ensureLocalUser(gatewayUserId) {
+  const existing = await db.prepare('SELECT id FROM users WHERE gateway_user_id = ?').get(gatewayUserId);
+  if (existing) return existing.id;
+  const id = createUserId();
+  try {
+    await db.prepare('INSERT INTO users (id, gateway_user_id) VALUES (?, ?)').run(id, gatewayUserId);
+    return id;
+  } catch (_) {
+    // 并发注册或首次登录同时建行：以库里已有的为准。
+    const row = await db.prepare('SELECT id FROM users WHERE gateway_user_id = ?').get(gatewayUserId);
+    return row ? row.id : null;
+  }
+}
 
 // 用户名→网关用户ID。
 // 不用 gateway.publicProfile：它要求请求参数本身就是用户ID。
