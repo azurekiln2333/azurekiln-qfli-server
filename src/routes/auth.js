@@ -166,9 +166,39 @@ router.post('/register', async (req, res) => {
     username, email, password, confirm_password: password,
     name: text(req.body, 'nickname', 64, false) || username, ...verificationFields(req.body), email_code: emailCode,
   });
-  await audit(req, { username, action: 'auth.register', loginType: 'register' });
+  // 验收第 1 条要求注册日志也带用户ID。注册接口已把账号建在网关上，
+  // 这里用同一套客户端凭据从网关公开资料取 sub，再映射到本地 users 行。
+  // 取不到时保留 null，不假造 ID。
+  const gatewayUserId = await registeredGatewayUser(username);
+  const registered = gatewayUserId
+    ? await db.prepare('SELECT id FROM users WHERE gateway_user_id = ?').get(gatewayUserId).catch(() => null)
+    : null;
+  await audit(req, {
+    userId: registered?.id ?? null, username, action: 'auth.register', loginType: 'register',
+  });
   res.json(result);
 });
+
+// 用户名→网关用户ID。
+// 不用 gateway.publicProfile：它要求请求参数本身就是用户ID。
+// 这里直接拼公开资料路径，凭据与日志走同一套客户端 Basic 鉴权。
+async function registeredGatewayUser(username) {
+  try {
+    const cfg = gateway.config();
+    const template = gateway.endpoint('publicProfile');
+    const claims = await gateway.request(template.replace('{id}', encodeURIComponent(username)), {
+      stage: 'gateway.public_profile_by_name',
+      headers: {
+        authorization: `Basic ${Buffer.from(
+          `${encodeURIComponent(cfg.clientId)}:${encodeURIComponent(cfg.clientSecret)}`,
+        ).toString('base64')}`,
+      },
+    });
+    return gateway.subject(claims);
+  } catch (_) {
+    return null;
+  }
+}
 
 router.post('/logout', authRequired, async (req, res) => {
   await db.prepare('DELETE FROM auth_sessions WHERE id = ?').run(req.authSession.id);
