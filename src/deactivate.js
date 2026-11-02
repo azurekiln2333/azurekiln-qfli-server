@@ -99,41 +99,47 @@ async function deleteUserRows(tx, userId) {
   await tx.prepare('DELETE FROM point_ledger WHERE user_id = ?').run(userId);
   await tx.prepare('DELETE FROM redemptions WHERE user_id = ?').run(userId);
   await tx.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(userId);
-  for (const table of ['user_moderation', 'publish_rate', 'reports']) {
-    const column = table === 'reports' ? 'reporter_id' : 'user_id';
+  for (const table of ['user_moderation', 'publish_rate']) {
     try {
-      await tx.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(userId);
+      await tx.prepare(`DELETE FROM ${table} WHERE user_id = ?`).run(userId);
     } catch (err) {
       // 表不存在（W2b 未部署）时跳过，不影响注销。
       if (!/no such table|doesn't exist/i.test(err.message)) throw err;
     }
+  }
+  // 举报人已被注销时，把上报人换成去标识化值：列是 NOT NULL，
+  // 且举报记录要留存 365 天，不能删行也不能置空。
+  try {
+    await tx.prepare('UPDATE reports SET reporter_id = ? WHERE reporter_id = ?')
+      .run(`deleted_${anonymize(userId)}`, userId);
+  } catch (err) {
+    if (!/no such table|doesn't exist/i.test(err.message)) throw err;
   }
   await tx.prepare('DELETE FROM user_state WHERE user_id = ?').run(userId);
   await tx.prepare('DELETE FROM users WHERE id = ?').run(userId);
 }
 
 // 审计留存 365 天，但个人标识去标识化：action/target/时间/IP/端口/平台保留。
-// 覆盖两类行：该用户作为主体的（user_id），以及该用户作为处置对象的（target 里带 user:<id>）。
+// 覆盖三类行：主体是本人（user_id）、处置对象是本人（target 带 user:<id>）、
+// 以及只在 detail 里提到本人的行（如 admin.post_delete 的 author=<id>，target 是帖子）。
 // 只有主体是本人时才改 user_id，管理员处置记录的 user_id 仍指向管理员自己。
 async function deidentifyAudit(tx, userId) {
   const anonymized = `deleted_${anonymize(userId)}`;
   const rows = await tx.prepare(
-    'SELECT id, user_id, target, detail FROM audit_logs WHERE user_id = ? OR target LIKE ?',
-  ).all(userId, `%${userId}%`);
+    'SELECT id, user_id, target, detail FROM audit_logs WHERE user_id = ? OR target LIKE ? OR detail LIKE ?',
+  ).all(userId, `%${userId}%`, `%${userId}%`);
   for (const row of rows) {
     // target 与 detail 里可能出现 user_ 前缀的 ID，一并替换。
     const scrub = (value) => (typeof value === 'string' && value.includes(userId)
       ? value.split(userId).join(anonymized)
       : value);
-    const subject = row.user_id === userId ? anonymized : row.user_id;
-    const username = row.user_id === userId ? null : undefined;
-    if (username === undefined) {
-      await tx.prepare('UPDATE audit_logs SET target = ?, detail = ? WHERE id = ?')
-        .run(scrub(row.target), scrub(row.detail), row.id);
+    if (row.user_id === userId) {
+      await tx.prepare('UPDATE audit_logs SET user_id = ?, username = NULL, target = ?, detail = ? WHERE id = ?')
+        .run(anonymized, scrub(row.target), scrub(row.detail), row.id);
       continue;
     }
-    await tx.prepare('UPDATE audit_logs SET user_id = ?, username = NULL, target = ?, detail = ? WHERE id = ?')
-      .run(subject, scrub(row.target), scrub(row.detail), row.id);
+    await tx.prepare('UPDATE audit_logs SET target = ?, detail = ? WHERE id = ?')
+      .run(scrub(row.target), scrub(row.detail), row.id);
   }
   return anonymized;
 }
