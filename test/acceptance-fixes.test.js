@@ -129,40 +129,66 @@ async function api(method, route, { user, body } = {}) {
   });
 }
 
-// 验收第 1 条：注册审计必须带用户ID。
-test('register writes an audit row carrying the new local user id', async () => {
-  const newUser = `user_${'d'.repeat(32)}`;
-  const newSub = 'gateway-sub-newcomer';
+// 验收第 1 条：注册审计必须带用户ID。首次注册时本地还没有 users 行，代码要自己建映射。
+test('register creates the local user mapping and audits the new user id', async () => {
+  const newSub = 'gateway-sub-first-time';
   const originalFetch = global.fetch;
-  const calls = [];
-  global.fetch = async (url, options = {}) => {
+  global.fetch = async (url) => {
     const urlPath = new URL(String(url)).pathname;
-    calls.push({ urlPath, method: options.method });
     if (urlPath === '/oauth2/register') {
       return Response.json({ redirect: 'https://app.example.test/login?done=1' });
     }
-    // 注册后从网关公开资料取 sub（和正式网关一致：Basic 客户端凭据）。
     if (urlPath.startsWith('/oauth2/public-profile/')) {
-      return Response.json({ sub: newSub, preferred_username: 'acceptance_new', isAdmin: false });
+      return Response.json({ sub: newSub, preferred_username: 'acceptance_first' });
     }
     throw new Error(`unexpected gateway call ${urlPath}`);
   };
   try {
-    // 本地 users 行通常在首次登录时建立；这里模拟网关侧已存在账号后本地已有行。
-    await db.prepare('INSERT OR IGNORE INTO users (id, gateway_user_id) VALUES (?, ?)').run(newUser, newSub);
+    // 关键：本地没有该 sub 的 users 行，模拟真实首次注册。
+    assert.equal(await db.prepare('SELECT 1 FROM users WHERE gateway_user_id = ?').get(newSub), undefined);
     const reply = await api('POST', '/api/auth/register', {
-      body: { username: 'acceptance_new', email: 'new@example.test', password: 'Passw0rd!', emailCode: '123456' },
+      body: { username: 'acceptance_first', email: 'first@example.test', password: 'Passw0rd!', emailCode: '123456' },
     });
     assert.equal(reply.status, 200);
+
     const row = await db.prepare("SELECT * FROM audit_logs WHERE action = 'auth.register'").get();
     assert.ok(row, '注册必须写审计');
-    assert.equal(row.user_id, newUser, '注册审计必须带本地用户ID');
-    assert.equal(row.username, 'acceptance_new');
+    assert.ok(row.user_id, '首次注册也必须带用户ID，不能是 null');
+    assert.match(row.user_id, /^user_[0-9a-f]{32}$/);
+
+    // 审计里的用户ID必须能在本地 users 表找到，并与网关 sub 对应。
+    const local = await db.prepare('SELECT * FROM users WHERE id = ?').get(row.user_id);
+    assert.ok(local, '注册审计的 user_id 必须是本地真实用户');
+    assert.equal(local.gateway_user_id, newSub);
+    assert.equal(row.username, 'acceptance_first');
     assert.equal(row.login_type, 'register');
     assert.equal(row.port, 45678);
     assert.equal(row.platform, 'harmonyos-app');
-    assert.ok(calls.some((call) => call.urlPath.startsWith('/oauth2/public-profile/')),
-      '注册后需要向网关查 sub');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('register reuses an existing local user instead of creating a duplicate', async () => {
+  const existingSub = 'gateway-sub-existing';
+  const existingId = `user_${'9'.repeat(32)}`;
+  await db.prepare('INSERT OR IGNORE INTO users (id, gateway_user_id) VALUES (?, ?)').run(existingId, existingSub);
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    const urlPath = new URL(String(url)).pathname;
+    if (urlPath === '/oauth2/register') return Response.json({ redirect: 'https://app.example.test/login' });
+    if (urlPath.startsWith('/oauth2/public-profile/')) return Response.json({ sub: existingSub });
+    throw new Error(`unexpected gateway call ${urlPath}`);
+  };
+  try {
+    const reply = await api('POST', '/api/auth/register', {
+      body: { username: 'acceptance_existing', email: 'e@example.test', password: 'Passw0rd!', emailCode: '123456' },
+    });
+    assert.equal(reply.status, 200);
+    const row = await db.prepare("SELECT * FROM audit_logs WHERE action = 'auth.register'").get();
+    assert.equal(row.user_id, existingId);
+    const count = (await db.prepare('SELECT COUNT(*) AS n FROM users WHERE gateway_user_id = ?').get(existingSub)).n;
+    assert.equal(count, 1, '不能重复建用户');
   } finally {
     global.fetch = originalFetch;
   }
@@ -209,6 +235,13 @@ test('deactivation deidentifies audit rows where the user is the target', async 
     'audit_unmute', adminId, 'accept_admin', 'admin.account_unmute', `user:${target}`,
     'reason=unmute', '198.51.100.17', 45678, 'harmonyos-app',
   );
+  // 只在 detail 里提到目标用户的跨操作者记录：管理员删帖时把作者写在 detail。
+  // 这条行 user_id 是管理员，target 是帖子编号，只有 detail 含原用户ID。
+  await db.prepare(`INSERT INTO audit_logs (id, user_id, username, action, target, detail, ip, port, platform)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'audit_post_delete', adminId, 'accept_admin', 'admin.post_delete', 'post:post_abc',
+    `author=${target} reason=违规`, '198.51.100.17', 45678, 'harmonyos-app',
+  );
 
   const originalFetch = global.fetch;
   global.fetch = async () => Response.json({ status: 'deleted', tokens_revoked: true });
@@ -224,17 +257,23 @@ test('deactivation deidentifies audit rows where the user is the target', async 
   }
 
   const rows = await db.prepare('SELECT * FROM audit_logs ORDER BY id').all();
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   for (const row of rows) {
     assert.ok(!String(row.target).includes(target), `target 仍含原用户ID：${row.target}`);
-    assert.match(row.target, /^user:deleted_[0-9a-f]{32}$/);
     assert.ok(!String(row.detail).includes(target), `detail 仍含原用户ID：${row.detail}`);
     // 管理员自己的身份保留。
     assert.equal(row.user_id, adminId);
     assert.equal(row.username, 'accept_admin');
   }
   // 目标不同的两行去标识化结果一致，仍可归并核对。
-  assert.equal(rows[0].target, rows[1].target);
+  const mute = rows.find((row) => row.id === 'audit_mute');
+  const unmute = rows.find((row) => row.id === 'audit_unmute');
+  assert.equal(mute.target, unmute.target);
+  assert.match(mute.target, /^user:deleted_[0-9a-f]{32}$/);
+  // 只在 detail 里提到目标的记录：target 不受影响，detail 已清洗。
+  const deleted = rows.find((row) => row.id === 'audit_post_delete');
+  assert.equal(deleted.target, 'post:post_abc');
+  assert.match(deleted.detail, /^author=deleted_[0-9a-f]{32} reason=违规$/);
 });
 
 // 验收第 7 条：网关注销失败时必须留一条失败审计。
