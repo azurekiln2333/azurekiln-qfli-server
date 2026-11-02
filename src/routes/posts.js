@@ -83,7 +83,10 @@ router.get('/posts', authOptional, async (req, res) => {
   const where = [];
   const params = [];
   // 先审后发：pending 只对作者本人与管理员可见，其他人只看 published。
-  if (req.userId) {
+  // 管理员需要看到待审列表并处置，因此列表和详情都按其视角放开 pending。
+  if (req.user?.is_admin) {
+    where.push("p.status IN ('published', 'pending')");
+  } else if (req.userId) {
     where.push("(p.status = 'published' OR (p.status = 'pending' AND p.user_id = ?))");
     params.push(req.userId);
   } else {
@@ -128,7 +131,7 @@ router.get('/posts/:id', authOptional, async (req, res) => {
     .prepare(`${POST_SUMMARY_SELECT} WHERE p.id = ?`)
     .get(req.params.id);
   if (!row) return res.status(404).json({ error: '内容不存在' });
-  if (row.status !== 'published' && row.user_id !== req.userId) {
+  if (row.status !== 'published' && row.user_id !== req.userId && !req.user?.is_admin) {
     return res.status(404).json({ error: '内容不存在' });
   }
   res.json({ post: { ...(await mapSummary(row, req.userId)), content: row.content } });

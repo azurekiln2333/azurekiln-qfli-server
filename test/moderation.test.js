@@ -430,3 +430,32 @@ test('pending comments stay visible only to their author', async () => {
   const own = await api('GET', `/api/posts/${created.json.id}/comments/mine`, { user: BOB });
   assert.equal(own.json.items.length, 1);
 });
+
+// 验收回归：管理员必须能看到并处理 pending 帖子（列表与详情均不得漏项）。
+test('admins can see pending posts in both the list and the detail route', async () => {
+  await moderation.setPrePublish(true);
+  const created = await createPost(ALICE);
+  assert.equal(created.json.status, 'pending');
+
+  const adminList = await api('GET', '/api/posts', { user: ADMIN });
+  assert.equal(adminList.status, 200);
+  const pendingInList = adminList.json.items.filter((item) => item.status === 'pending');
+  assert.equal(pendingInList.length, 1, '管理员列表必须包含待审帖子');
+  assert.equal(pendingInList[0].id, created.json.id);
+
+  const adminDetail = await api('GET', `/api/posts/${created.json.id}`, { user: ADMIN });
+  assert.equal(adminDetail.status, 200, '管理员必须能打开待审帖详情');
+  assert.equal(adminDetail.json.post.status, 'pending');
+  assert.equal(adminDetail.json.post.content, '这是一段正常的技术讨论正文。');
+
+  // 非作者非管理员仍然看不到。
+  assert.equal((await api('GET', `/api/posts/${created.json.id}`, { user: BOB })).status, 404);
+  assert.equal((await api('GET', `/api/posts/${created.json.id}`)).status, 404);
+
+  // 管理员能处置：改用 published 后对所有人可见。
+  const approved = await api('PATCH', `/api/admin/posts/${created.json.id}/status`, {
+    user: ADMIN, body: { status: 'published', reason: '人工复核通过' },
+  });
+  assert.equal(approved.status, 200);
+  assert.equal((await api('GET', `/api/posts/${created.json.id}`, { user: BOB })).status, 200);
+});
