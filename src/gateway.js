@@ -44,6 +44,23 @@ function required(name) {
   return value;
 }
 
+// 华为账号没有已验证手机号时，网关在 quick-login（不签发 binding_token）
+// 以及使用旧 token 的 skip/bind 上返回 403 error=huawei_verified_phone_required。
+// 对外只暴露 contracts.md C 节的统一形状：403 + errorKey=huawei.phone_required。
+const HUAWEI_PHONE_REQUIRED = 'huawei_verified_phone_required';
+const HUAWEI_PHONE_REQUIRED_MESSAGE = '请使用已绑定手机号的华为账号';
+
+function phoneRequiredError() {
+  return new ApiError(403, HUAWEI_PHONE_REQUIRED_MESSAGE, {
+    errorKey: 'huawei.phone_required',
+    message: HUAWEI_PHONE_REQUIRED_MESSAGE,
+  });
+}
+
+function isPhoneRequiredError(data) {
+  return data?.error === HUAWEI_PHONE_REQUIRED || data?.error_key === HUAWEI_PHONE_REQUIRED;
+}
+
 function config(req) {
   const base = (process.env.PUBLIC_BASE_URL || (req ? `${req.protocol}://${req.get('host')}` : '')).replace(/\/+$/, '');
   return {
@@ -79,6 +96,8 @@ async function request(url, options = {}) {
       errorCode: typeof data?.error === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/.test(data.error) ? data.error : undefined,
     }, response.ok ? 'info' : 'error');
     if (!response.ok) {
+      // 网关的“华为账号缺少已核验手机号”统一转换为 huawei.phone_required。
+      if (isPhoneRequiredError(data)) throw phoneRequiredError();
       const status = [400, 401, 403, 404, 409, 422, 428, 429, 503].includes(response.status) ? response.status : 502;
       const message = typeof data?.error_description === 'string' ? data.error_description : data?.error;
       throw new ApiError(status, typeof message === 'string' ? message.slice(0, 200) : '登录网关请求失败', { errorKey: data?.error_key });
@@ -280,4 +299,4 @@ async function publicProfile(gatewayUserId) {
   return claims;
 }
 
-module.exports = { ApiError, required, endpoint, config, request, pkce, subject, exchange, authorize, loginRequirements, completeHuawei, skipHuawei, bindHuawei, userinfo, refresh, register, sendEmailCode, updateProfile, publicProfile };
+module.exports = { ApiError, required, endpoint, config, request, pkce, subject, exchange, authorize, loginRequirements, completeHuawei, skipHuawei, bindHuawei, userinfo, refresh, register, sendEmailCode, updateProfile, publicProfile, phoneRequiredError, isPhoneRequiredError, HUAWEI_PHONE_REQUIRED_MESSAGE };

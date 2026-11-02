@@ -94,11 +94,10 @@ function huaweiBinding(body) {
   }
   if (entry.inProgress) throw new gateway.ApiError(409, '正在处理绑定请求，请稍候');
   // 没有已验证手机号的华为账号无法完成实名，不允许跳过绑定直接建号。
+  // 与网关的 huawei_verified_phone_required 用同一个对外形状（contracts.md C 节）。
   if (entry.phoneAvailable === false) {
     huaweiBindings.delete(bindingId);
-    throw new gateway.ApiError(403, '请使用已绑定手机号的华为账号', {
-      errorKey: 'realname.phone_required',
-    });
+    throw gateway.phoneRequiredError();
   }
   entry.inProgress = true;
   return { bindingId, entry };

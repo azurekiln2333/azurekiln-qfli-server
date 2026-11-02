@@ -3,8 +3,7 @@
 const db = require('./db');
 const identity = require('./identity');
 const { createId } = require('./entity-id');
-const { clientPlatform } = require('./client-context');
-const { clientIp, clientPort } = require('./client-ip');
+const { clientPlatform, auditIp, auditPort } = require('./client-context');
 const { anonymize } = require('./anonymize');
 const { RETENTION_DAYS } = require('./audit-retention');
 
@@ -21,8 +20,8 @@ async function audit(req, { userId, username, action, target, detail, loginType 
       action,
       target ?? null,
       detail == null ? null : String(detail).slice(0, 2000),
-      clientIp(req),
-      clientPort(req),
+      auditIp(req),
+      auditPort(req),
       clientPlatform(req),
       loginType == null ? null : String(loginType).slice(0, 32),
       String(req?.headers?.['user-agent'] || '').slice(0, 300),
