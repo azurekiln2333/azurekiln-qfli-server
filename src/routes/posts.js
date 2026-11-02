@@ -7,6 +7,7 @@ const { author } = require('../identity');
 const { createId } = require('../entity-id');
 const moderation = require('../moderation-service');
 const { clientIp } = require('../client-ip');
+const adminAccess = require('../admin-access');
 
 const router = express.Router();
 
@@ -84,7 +85,9 @@ router.get('/posts', authOptional, async (req, res) => {
   const params = [];
   // 先审后发：pending 只对作者本人与管理员可见，其他人只看 published。
   // 管理员需要看到待审列表并处置，因此列表和详情都按其视角放开 pending。
-  if (req.user?.is_admin) {
+  // 注意：列表走 authOptional，req.user 可能不存在，管理员判定要单独查。
+  const viewerIsAdmin = await adminAccess.isAdmin(req);
+  if (viewerIsAdmin) {
     where.push("p.status IN ('published', 'pending')");
   } else if (req.userId) {
     where.push("(p.status = 'published' OR (p.status = 'pending' AND p.user_id = ?))");
@@ -131,7 +134,7 @@ router.get('/posts/:id', authOptional, async (req, res) => {
     .prepare(`${POST_SUMMARY_SELECT} WHERE p.id = ?`)
     .get(req.params.id);
   if (!row) return res.status(404).json({ error: '内容不存在' });
-  if (row.status !== 'published' && row.user_id !== req.userId && !req.user?.is_admin) {
+  if (row.status !== 'published' && row.user_id !== req.userId && !(await adminAccess.isAdmin(req))) {
     return res.status(404).json({ error: '内容不存在' });
   }
   res.json({ post: { ...(await mapSummary(row, req.userId)), content: row.content } });
