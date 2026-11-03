@@ -83,6 +83,28 @@ require(!/qflistudio-next/.test(compose), 'the retired qflistudio-next image pat
 require(/CNB_REPO_SLUG_LOWERCASE/.test(ci), 'CI must namespace the image by the CNB repository slug');
 require(/qfli-server/.test(ci), 'CI must publish the qfli-server image name');
 require(/services:\s*\n\s*- docker/.test(ci), 'CI image pipeline needs the docker service');
+// Every CNB job that runs node must pin an image that actually has node. The
+// platform default build image does not, which fails with `node: command not
+// found` only once the pipeline runs. Job entries are `NNNN- name:` list items.
+// Job entries sit at four spaces under a trigger; stage entries nest deeper.
+const cnbJobs = ci.split(/(?=^ {4}- name: )/m).filter(chunk => /^ {4}- name: /.test(chunk));
+require(cnbJobs.length >= 3, 'the CNB config must list its jobs');
+// Resolve `docker: *anchor` against the anchor definition before judging a job.
+const cnbAnchors = Object.fromEntries(
+  [...ci.matchAll(/&([\w-]+)\s*\n\s*image:\s*(\S+)/g)].map(match => [match[1], match[2]]),
+);
+for (const job of cnbJobs) {
+  const name = job.match(/^ {4}- name: (.+)$/m)[1].trim();
+  if (!/scripts\/ci-common\.mjs/.test(job)) continue;
+  // The image lives in the header, above the stages list.
+  const header = job.slice(0, job.indexOf('stages:'));
+  const literal = header.match(/image:\s*(\S+)/);
+  const alias = header.match(/docker:\s*\*([\w-]+)/);
+  const image = literal ? literal[1] : cnbAnchors[alias && alias[1]];
+  require(image === 'node:24.15.0-bookworm',
+    `CNB job "${name}" runs node, so it must use node:24.15.0-bookworm (got ${image || 'no image'})`);
+}
+require(!/cnbcool\/default-build-env/.test(ci), 'the CNB default build image has no node; do not use it for node jobs');
 // CI validation commands live in one place so four pipelines cannot drift.
 require(/\['npm', \['ci'\]\]/.test(read('scripts/ci-common.mjs')), 'the shared CI script must install dependencies before tests');
 

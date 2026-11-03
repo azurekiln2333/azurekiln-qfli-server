@@ -24,7 +24,10 @@
 因此发布步骤传 `--no-login`。CNB 只提供 `CNB_TOKEN`，不提供 `CI_REGISTRY_PASSWORD`，
 手动登录无密码可读。
 
-发布任务使用 CNB 云原生构建的缺省镜像 `cnbcool/default-build-env`（自带 Node 与 Docker CLI）。
+发布任务与校验任务都使用 `node:24.15.0-bookworm`。
+CNB 缺省构建镜像没有 Node，跑 `node` 会直接报 `node: command not found`，
+所以每个跑 Node 脚本的 job 都必须显式指定该镜像。
+`check-deployment.mjs` 会解析锚点并逐 job 断言镜像，防止回退到缺省镜像。
 `publish` 在构建镜像前重跑全部校验，测试失败就不会推送。
 `main` 分支的 `--ref` 由 `CNB_BRANCH` 拼成 `refs/heads/<分支>`，标签流水线拼成 `refs/tags/<标签>`。
 

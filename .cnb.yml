@@ -5,10 +5,15 @@
 # Image namespace follows the CNB rule docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}/<name>,
 # which gives docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server.
 #
+# Every job here runs `node`, so every job pins node:24.15.0-bookworm. The CNB
+# default build image has no Node and fails with `node: command not found`.
+#
 # `services: [docker]` injects a Docker daemon and runs `docker login` against
 # docker.cnb.cool for the current repository, so the publish steps pass
 # --no-login. CNB defines CNB_TOKEN, not CI_REGISTRY_PASSWORD, so a manual
 # login from this file would have no password to read.
+# The deployment contract check reads docker-compose.yaml as text, so no
+# Compose CLI is needed here; only Node and, for publish, the docker client.
 # Pull requests validate only; they never push images.
 
 main:
@@ -21,8 +26,7 @@ main:
           script: node scripts/ci-common.mjs verify
 
     - name: publish-image
-      docker:
-        image: cnbcool/default-build-env
+      docker: *node-runtime
       services:
         - docker
       stages:
@@ -45,8 +49,7 @@ main:
 "v*":
   tag_push:
     - name: publish-release-image
-      docker:
-        image: cnbcool/default-build-env
+      docker: *node-runtime
       services:
         - docker
       stages:
