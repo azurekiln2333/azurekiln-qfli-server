@@ -1,0 +1,31 @@
+# AtomGit (gitcode.com) Action pipeline.
+#
+# Validation only. AtomGit pipelines need an internal-test quota from AtomGit
+# support, and no public documentation describes a free managed container
+# registry that accepts pushes from a pipeline, so this repository publishes no
+# image here. See deploy/ci-platforms.md for the sources and the decision.
+#
+# The workflow lives in .gitcode/workflows/ by platform rule; the path is not
+# configurable. Pull requests do not need secrets, so fork isolation is harmless.
+name: Verify
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  repository: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: [ubuntu-latest, x64, small]
+    steps:
+      - name: Check out
+        uses: checkout
+      - name: Install dependencies
+        run: npm ci
+      - name: Validate
+        run: node scripts/ci-common.mjs verify
