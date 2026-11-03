@@ -17,6 +17,10 @@ const compose = read('docker-compose.yaml');
 const buildCompose = read('docker-compose.build.yaml');
 const envExample = read('.env.example');
 const ci = read('.cnb.yml');
+const composeCi = read('.github/workflows/build-and-push.yml');
+const gitlabCi = read('.gitlab-ci.yml');
+const gitcodeCi = read('.gitcode/workflows/verify.yml');
+const ciPlatforms = read('deploy/ci-platforms.md');
 
 require(/FROM node:/.test(dockerfile), 'Dockerfile must start from a pinned Node image');
 require(!/executor/.test(dockerfileDirectives), 'business image must not embed the terminal executor');
@@ -50,11 +54,53 @@ require(/QFLI_TERMINAL_NODES=/.test(envExample), '.env.example must document the
 require(/QFLI_TERMINAL_URL=/.test(envExample), '.env.example must keep the legacy single-node setting');
 require(!/QFLI_TERMINAL_SECRET=.+/.test(envExample), '.env.example must not ship a terminal secret');
 
+// Every required key must be present and empty, so a copy-paste deploy cannot
+// silently ship a guessed value.
+const requiredEmpty = [
+  'QFLI_JWT_SECRET', 'MYSQL_PASSWORD', 'AZK_OAUTH2_BASE_URL', 'AZK_OAUTH2_CLIENT_ID',
+  'AZK_OAUTH2_CLIENT_SECRET', 'QFLI_TERMINAL_SECRET', 'MODERATION_BASE_URL',
+  'MODERATION_API_KEY', 'MODERATION_ADMIN_KEY', 'QFLI_MODERATION_SUBJECT_SALT',
+  'QFLI_AI_API_KEY',
+];
+// MODERATION_APP_ID must equal the app id the moderation service registered.
+require(/^MODERATION_APP_ID=qflistudio$/m.test(envExample), '.env.example must fix the moderation app id');
+for (const key of requiredEmpty) {
+  require(new RegExp(`^${key}=$`, 'm').test(envExample), `.env.example must list ${key} with an empty value`);
+}
+// The compose file reads these; a missing key makes the default image unset.
+require(/^QFLI_SERVER_IMAGE=docker\.cnb\.cool\/azurekiln\/azurekiln-qfli-server\/qfli-server:latest$/m.test(envExample),
+  '.env.example must name the default CNB image');
+for (const key of ['QFLI_SERVER_WATCHTOWER_IMAGE', 'WATCHTOWER_POLL_INTERVAL', 'QFLI_SERVER_MEMORY', 'QFLI_SERVER_CPUS', 'QFLI_SERVER_UID', 'QFLI_SERVER_GID']) {
+  require(new RegExp(`^${key}=`, 'm').test(envExample), `.env.example must list the compose setting ${key}`);
+}
+require(/^TERMINAL_RATE_LIMIT=/m.test(envExample), '.env.example must list TERMINAL_RATE_LIMIT');
+
+// The compose default and the image the CNB pipeline publishes must agree.
+require(/docker\.cnb\.cool\/azurekiln\/azurekiln-qfli-server\/qfli-server:latest/.test(compose),
+  'the default compose image must be the published CNB image');
+require(!/qflistudio-next/.test(compose), 'the retired qflistudio-next image path must be gone');
+
 require(/CNB_REPO_SLUG_LOWERCASE/.test(ci), 'CI must namespace the image by the CNB repository slug');
 require(/qfli-server/.test(ci), 'CI must publish the qfli-server image name');
 require(/services:\s*\n\s*- docker/.test(ci), 'CI image pipeline needs the docker service');
-require(/case "\$VERSION" in[\s\S]*\*-\*\)/.test(ci), 'prerelease tags must be detected by a dash suffix');
-require(/npm ci/.test(ci), 'every CI job that runs tests must install dependencies first');
+// CI validation commands live in one place so four pipelines cannot drift.
+require(/\['npm', \['ci'\]\]/.test(read('scripts/ci-common.mjs')), 'the shared CI script must install dependencies before tests');
+
+for (const [file, text, platform] of [
+  ['.cnb.yml', ci, 'cnb'],
+  ['.github/workflows/build-and-push.yml', composeCi, 'github'],
+  ['.gitlab-ci.yml', gitlabCi, 'gitlab'],
+]) {
+  require(new RegExp(`scripts/ci-common\\.mjs publish[\\s\\S]*--platform ${platform}`).test(text),
+    `${file} must publish through scripts/ci-common.mjs --platform ${platform}`);
+  require(/scripts\/ci-common\.mjs verify/.test(text), `${file} must verify through scripts/ci-common.mjs`);
+}
+require(!/docker\.login|\.npmrc/.test(gitlabCi), 'GitLab must use the predefined registry credentials, not a stored secret');
+require(/services:\s*\n\s*- name: \$DOCKER_DIND_IMAGE/.test(gitlabCi), 'GitLab needs the dind service to build');
+require(/scripts\/ci-common\.mjs verify/.test(gitcodeCi), 'GitCode validates only');
+require(!/docker\s+(build|push)/.test(gitcodeCi), 'GitCode must not publish an image');
+require(/# Gitee：不加工作流/.test(ciPlatforms), 'deploy/ci-platforms.md must state the Gitee decision');
+require(/# GitCode \/ AtomGit：只加校验/.test(ciPlatforms), 'deploy/ci-platforms.md must state the GitCode decision');
 
 if (failures.length) {
   for (const failure of failures) console.error(`FAIL ${failure}`);
