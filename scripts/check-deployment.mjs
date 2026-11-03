@@ -100,6 +100,9 @@ require(/services:\s*\n\s*- name: \$DOCKER_DIND_IMAGE/.test(gitlabCi), 'GitLab n
 require(/scripts\/ci-common\.mjs verify/.test(gitcodeCi), 'GitCode validates only');
 require(!/docker\s+(build|push)/.test(gitcodeCi), 'GitCode must not publish an image');
 require(/# Gitee：不加工作流/.test(ciPlatforms), 'deploy/ci-platforms.md must state the Gitee decision');
+// GitHub logs in in its own step; the script must not try a second login.
+require(/--no-login/.test(composeCi), 'the GitHub publish step must reuse the workflow login');
+require(/docker login ghcr\.io/.test(composeCi), 'the GitHub workflow must log in to GHCR');
 require(/# GitCode \/ AtomGit：只加校验/.test(ciPlatforms), 'deploy/ci-platforms.md must state the GitCode decision');
 
 if (failures.length) {

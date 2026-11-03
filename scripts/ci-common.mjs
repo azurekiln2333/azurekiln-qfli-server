@@ -9,7 +9,6 @@
 //   node scripts/ci-common.mjs publish --platform github --ref refs/heads/main --revision abc1234
 //   node scripts/ci-common.mjs publish --platform gitlab --ref v1.0.0 --registry registry.gitlab.com/x/y --username gitlab-ci-token --password-stdin
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { URL } from 'node:url';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -81,19 +80,6 @@ export function runVerify(run = execute) {
   for (const [command, args] of COMMANDS.verify) run(command, args);
 }
 
-function credentialedRegistries() {
-  // Only names are reported: a credential echoed into a log is worse than a failed push.
-  const home = process.env.DOCKER_CONFIG || resolve(process.env.HOME || process.env.USERPROFILE || '.', '.docker');
-  const file = resolve(home, 'config.json');
-  if (!existsSync(file)) throw new Error('docker login did not write config.json');
-  const auths = JSON.parse(readFileSync(file, 'utf8')).auths || {};
-  const hosts = Object.entries(auths)
-    .filter(([, value]) => value && value.auth)
-    .map(([registry]) => new URL(registry.includes('://') ? registry : `https://${registry}`).host);
-  if (!hosts.length) throw new Error('docker login left no credential; the push would be anonymous');
-  return hosts;
-}
-
 export function runPublish({ platform, repository, ref, revision, env = process.env, run = execute, login = true }) {
   if (!ref || !revision) throw new Error('Publishing needs --ref and --revision');
   const plan = imagePlan({ platform, repository, ref, revision, env });
@@ -104,9 +90,10 @@ export function runPublish({ platform, repository, ref, revision, env = process.
     const user = env.CI_REGISTRY_USER || 'gitlab-ci-token';
     if (!env.CI_REGISTRY_PASSWORD) throw new Error('CI_REGISTRY_PASSWORD is required to publish');
     const host = new URL(`https://${plan.image}`).host;
+    // A non-zero exit is the only reliable signal: credential stores (desktop
+    // helper, DOCKER_CONFIG, remote helpers) do not have to write config.json.
     // The password arrives on stdin so it never appears in the process list.
     run('docker', ['login', host, '-u', user, '--password-stdin'], { input: env.CI_REGISTRY_PASSWORD });
-    if (!credentialedRegistries().includes(host)) throw new Error(`docker login wrote no credential for ${host}`);
   }
   run('docker', ['build', '--pull', '--file', 'Dockerfile', '--tag', source, '.']);
   run('docker', ['push', source]);
@@ -124,6 +111,11 @@ function parseArguments(argv) {
     const key = argv[index];
     if (!key.startsWith('--')) throw new Error(`Unexpected argument ${key}`);
     const name = key.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+    // --no-login is a switch, not a key/value pair.
+    if (key === '--no-login') {
+      options[name] = 'true';
+      continue;
+    }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith('--')) throw new Error(`Missing value for ${key}`);
     options[name] = value;
@@ -142,7 +134,11 @@ export function main(argv, env = process.env) {
   if (options.mode === 'publish') {
     const repository = options.repository || env.CI_PROJECT_PATH;
     const revision = options.revision || env.CI_COMMIT_SHA;
-    const plan = runPublish({ platform: options.platform, repository, ref: options.ref, revision, env });
+    // A platform that already logged in (CNB docker service, GitHub login step)
+    // keeps the credential in its own store; relogging in would need a secret
+    // this script may not have.
+    const login = options.noLogin !== 'true';
+    const plan = runPublish({ platform: options.platform, repository, ref: options.ref, revision, env, login });
     console.log(`Published ${plan.image}:${plan.tag}; latest=${plan.latest}`);
     return plan;
   }

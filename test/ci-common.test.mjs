@@ -115,3 +115,10 @@ test('publishing without a registry password is refused', () => {
     /CI_REGISTRY_PASSWORD/,
   );
 });
+
+test('a malformed repository or revision stops the build', () => {
+  assert.throws(() => imagePlan({ platform: 'github', repository: 'o', ref: 'refs/heads/main', revision }), /repository path/);
+  assert.throws(() => imagePlan({ platform: 'github', repository: 'o/r', ref: 'refs/heads/main', revision: 'HEAD' }), /revision/);
+  assert.throws(() => imagePlan({ platform: 'bitbucket', repository: 'o/r', ref: 'refs/heads/main', revision }), /Platform/);
+});
+

@@ -54,6 +54,8 @@ jobs:
           cache: npm
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # The script re-runs validation and then builds and pushes, keeping the
+      # image name, tag rules and latest promotion in one place.
       - name: Build and publish the tested image
         env:
           CI_REGISTRY_USER: ${{ github.actor }}
@@ -64,3 +66,4 @@ jobs:
           --ref "${{ github.ref }}"
           --revision "${{ github.sha }}"
           --repository "${{ github.repository }}"
+          --no-login
