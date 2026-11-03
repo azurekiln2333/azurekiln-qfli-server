@@ -104,6 +104,10 @@ require(/# Gitee：不加工作流/.test(ciPlatforms), 'deploy/ci-platforms.md m
 require(/--no-login/.test(composeCi), 'the GitHub publish step must reuse the workflow login');
 require(/docker login ghcr\.io/.test(composeCi), 'the GitHub workflow must log in to GHCR');
 require(/--steps push/.test(composeCi), 'the GitHub workflow must split build and push so a failure names the stage');
+// CNB defines CNB_TOKEN rather than CI_REGISTRY_PASSWORD; its docker service
+// logs in for you.
+require(/--no-login/.test(ci), 'the CNB publish steps must reuse the docker service login');
+require(/refs\/heads\/\$\{CNB_BRANCH\}/.test(ci), 'the CNB ref must be built from CNB_BRANCH');
 require(/# GitCode \/ AtomGit：只加校验/.test(ciPlatforms), 'deploy/ci-platforms.md must state the GitCode decision');
 
 if (failures.length) {

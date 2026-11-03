@@ -19,11 +19,14 @@
 
 `.cnb.yml` 的发布任务读取 `CNB_REPO_SLUG_LOWERCASE`、`CNB_COMMIT`、`CNB_BRANCH`，
 镜像名前缀由仓库路径决定，因此镜像地址为 `docker.cnb.cool/<仓库路径>/qfli-server`。
-`services: [docker]` 在可信推送与标签流水线里自动登录，配置文件不读任何注册表密钥。
 
-发布任务使用 `cnbcool/default-dev-env:latest` 镜像，该镜像需自带 Node 与 Docker CLI。
-`publish` 命令在构建镜像前重跑全部校验，测试失败就不会推送。
-建议在 CNB 控制台核对一次发布任务的运行结果，再依赖它出正式镜像。
+`services: [docker]` 会注入 Docker daemon，并**自动 `docker login` 到 `docker.cnb.cool`**，
+因此发布步骤传 `--no-login`。CNB 只提供 `CNB_TOKEN`，不提供 `CI_REGISTRY_PASSWORD`，
+手动登录无密码可读。
+
+发布任务使用 CNB 云原生构建的缺省镜像 `cnbcool/default-build-env`（自带 Node 与 Docker CLI）。
+`publish` 在构建镜像前重跑全部校验，测试失败就不会推送。
+`main` 分支的 `--ref` 由 `CNB_BRANCH` 拼成 `refs/heads/<分支>`，标签流水线拼成 `refs/tags/<标签>`。
 
 ## GitHub Actions
 

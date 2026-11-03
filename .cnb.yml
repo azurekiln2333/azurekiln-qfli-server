@@ -4,13 +4,12 @@
 #
 # Image namespace follows the CNB rule docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}/<name>,
 # which gives docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server.
-# `services: [docker]` logs in automatically on trusted push/tag pipelines and
-# the build environment already provides CI_REGISTRY_USER/CI_REGISTRY_PASSWORD.
-# Pull requests validate only; they never push images.
 #
-# The CNB docker service must mount `ci-common` from the build environment
-# (Docker Hub is required for the base image). Set CI_COMMIT_AUTHOR, or verify
-# this file against the CNB console before relying on it for a release.
+# `services: [docker]` injects a Docker daemon and runs `docker login` against
+# docker.cnb.cool for the current repository, so the publish steps pass
+# --no-login. CNB defines CNB_TOKEN, not CI_REGISTRY_PASSWORD, so a manual
+# login from this file would have no password to read.
+# Pull requests validate only; they never push images.
 
 main:
   push:
@@ -20,9 +19,10 @@ main:
       stages:
         - name: unit-tests
           script: node scripts/ci-common.mjs verify
+
     - name: publish-image
       docker:
-        image: cnbcool/default-dev-env:latest
+        image: cnbcool/default-build-env
       services:
         - docker
       stages:
@@ -30,9 +30,10 @@ main:
           script: >-
             node scripts/ci-common.mjs publish
             --platform cnb
-            --ref "$CNB_BRANCH_REF"
+            --ref "refs/heads/${CNB_BRANCH}"
             --revision "$CNB_COMMIT"
             --repository "$CNB_REPO_SLUG_LOWERCASE"
+            --no-login
 
   pull_request:
     - name: verify-pull-request
@@ -45,7 +46,7 @@ main:
   tag_push:
     - name: publish-release-image
       docker:
-        image: cnbcool/default-dev-env:latest
+        image: cnbcool/default-build-env
       services:
         - docker
       stages:
@@ -56,3 +57,4 @@ main:
             --ref "refs/tags/${CNB_BRANCH}"
             --revision "$CNB_COMMIT"
             --repository "$CNB_REPO_SLUG_LOWERCASE"
+            --no-login
