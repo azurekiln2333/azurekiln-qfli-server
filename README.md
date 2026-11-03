@@ -354,7 +354,8 @@ SQL 沙箱，一律 403 `realname.required`，客户端引导走华为账号绑�
 
 业务后端与终端执行器分别发布镜像。服务器只拉取预构建镜像。服务器不现场构建。
 
-业务镜像路径为 `docker.cnb.cool/<仓库路径>/qfli-server`。默认仓库路径是 `azurekiln/qflistudio-next`。
+默认镜像为 `docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server:latest`，
+由 CNB 流水线发布。镜像路径由仓库路径决定，见 `.cnb.yml` 与 `scripts/ci-common.mjs`。
 
 部署目录只放 `docker-compose.yaml`、`.env` 与 `data/`：
 
@@ -364,6 +365,12 @@ docker compose pull server watchtower
 docker compose up -d server watchtower
 docker compose ps
 ```
+
+`.env` 从 `.env.example` 复制。启动前必须填写 `QFLI_JWT_SECRET`、`MYSQL_PASSWORD`、
+`AZK_OAUTH2_BASE_URL`、`AZK_OAUTH2_CLIENT_ID`、`AZK_OAUTH2_CLIENT_SECRET`、
+`QFLI_TERMINAL_SECRET`、`MODERATION_BASE_URL`、`MODERATION_API_KEY`、
+`MODERATION_ADMIN_KEY`、`QFLI_MODERATION_SUBJECT_SALT` 与 `QFLI_AI_API_KEY`。
+审核相关的三项留空时，发布类请求一律返回 503。
 
 数据目录属于容器运行用户。迁移既有安装时先调整归属：
 
@@ -385,6 +392,30 @@ docker compose up -d server
 ```
 
 `up -d` 只在镜像变化时替换容器。回滚时把 `QFLI_SERVER_IMAGE` 固定到旧 digest，再执行 `up -d`。
+
+### 构建流水线
+
+校验与发布逻辑只有一份，放在 `scripts/ci-common.mjs`。各平台只负责检出、装 Node 和登录镜像仓库。
+
+| 平台 | 校验 | 发布镜像 | 镜像地址 | 配置文件 |
+| --- | --- | --- | --- | --- |
+| CNB | 是 | 是 | `docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server` | `.cnb.yml` |
+| GitHub Actions | 是 | 是 | `ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server` | `.github/workflows/build-and-push.yml` |
+| GitLab CI | 是 | 是 | `registry.gitlab.com/azurekiln-team/azurekiln-qfli-server/qfli-server` | `.gitlab-ci.yml` |
+| GitCode / AtomGit | 是 | 否 | 无 | `.gitcode/workflows/verify.yml` |
+| Gitee | 否 | 否 | 无 | 无 |
+
+标签规则：`main` 推送 `sha-<12位提交>` 并更新 `latest`；`vX.Y.Z` 推送同名标签并更新 `latest`；
+`vX.Y.Z-rc.1` 只推预发布标签，不动 `latest`。其他分支和非 semver 标签会被脚本拒绝。
+
+Gitee 的免费云构建只面向企业账户，GitCode 缺少公开的托管镜像仓库凭据说明。
+两家的依据与取舍写在 `deploy/ci-platforms.md`。
+
+改镜像来源时只改环境变量，不改 compose 默认值：
+
+```sh
+QFLI_SERVER_IMAGE=ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server:latest
+```
 
 ### 多执行节点
 
