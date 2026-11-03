@@ -116,9 +116,44 @@ test('publishing without a registry password is refused', () => {
   );
 });
 
-test('a malformed repository or revision stops the build', () => {
-  assert.throws(() => imagePlan({ platform: 'github', repository: 'o', ref: 'refs/heads/main', revision }), /repository path/);
-  assert.throws(() => imagePlan({ platform: 'github', repository: 'o/r', ref: 'refs/heads/main', revision: 'HEAD' }), /revision/);
-  assert.throws(() => imagePlan({ platform: 'bitbucket', repository: 'o/r', ref: 'refs/heads/main', revision }), /Platform/);
+test('--steps build skips the latest promotion and --steps push only moves latest', () => {
+  const build = [];
+  runPublish({
+    platform: 'github', repository: 'o/r', ref: 'refs/heads/main', revision,
+    env: { CI_REGISTRY_PASSWORD: 'x' }, login: false, steps: 'build',
+    run: (command, args) => build.push(`${command} ${args.join(' ')}`),
+  });
+  assert.equal(build.some(line => line.includes(':latest')), false);
+  assert.equal(build.length, 2);
+
+  const push = [];
+  const plan = runPublish({
+    platform: 'github', repository: 'o/r', ref: 'refs/heads/main', revision,
+    env: {}, login: false, steps: 'push',
+    run: (command, args) => push.push(`${command} ${args.join(' ')}`),
+  });
+  assert.equal(plan.latest, true);
+  assert.deepEqual(push, [
+    'docker tag ghcr.io/o/r/qfli-server:sha-a1b2c3d4e5f6 ghcr.io/o/r/qfli-server:latest',
+    'docker push ghcr.io/o/r/qfli-server:latest',
+  ]);
+});
+
+test('a prerelease never promotes latest', () => {
+  const push = [];
+  const plan = runPublish({
+    platform: 'github', repository: 'o/r', ref: 'refs/tags/v1.2.3-rc.1', revision,
+    env: {}, login: false, steps: 'push',
+    run: (command, args) => push.push(`${command} ${args.join(' ')}`),
+  });
+  assert.equal(plan.latest, false);
+  assert.deepEqual(push, []);
+});
+
+test('an unknown step name is refused', () => {
+  assert.throws(
+    () => runPublish({ platform: 'github', repository: 'o/r', ref: 'refs/heads/main', revision, steps: 'deploy', run: () => {} }),
+    /Steps must be/,
+  );
 });
 

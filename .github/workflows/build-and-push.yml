@@ -54,12 +54,11 @@ jobs:
           cache: npm
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      # The script re-runs validation and then builds and pushes, keeping the
-      # image name, tag rules and latest promotion in one place.
-      - name: Build and publish the tested image
-        env:
-          CI_REGISTRY_USER: ${{ github.actor }}
-          CI_REGISTRY_PASSWORD: ${{ github.token }}
+      # Split so a failure names the exact stage in the job summary. The script
+      # still owns the image name and tag rules; --steps narrows the work.
+      - name: Re-run validation before publishing
+        run: node scripts/ci-common.mjs verify
+      - name: Build the image
         run: >-
           node scripts/ci-common.mjs publish
           --platform github
@@ -67,3 +66,13 @@ jobs:
           --revision "${{ github.sha }}"
           --repository "${{ github.repository }}"
           --no-login
+          --steps build
+      - name: Push the image and latest
+        run: >-
+          node scripts/ci-common.mjs publish
+          --platform github
+          --ref "${{ github.ref }}"
+          --revision "${{ github.sha }}"
+          --repository "${{ github.repository }}"
+          --no-login
+          --steps push

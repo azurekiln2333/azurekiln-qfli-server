@@ -103,6 +103,7 @@ require(/# Gitee：不加工作流/.test(ciPlatforms), 'deploy/ci-platforms.md m
 // GitHub logs in in its own step; the script must not try a second login.
 require(/--no-login/.test(composeCi), 'the GitHub publish step must reuse the workflow login');
 require(/docker login ghcr\.io/.test(composeCi), 'the GitHub workflow must log in to GHCR');
+require(/--steps push/.test(composeCi), 'the GitHub workflow must split build and push so a failure names the stage');
 require(/# GitCode \/ AtomGit：只加校验/.test(ciPlatforms), 'deploy/ci-platforms.md must state the GitCode decision');
 
 if (failures.length) {

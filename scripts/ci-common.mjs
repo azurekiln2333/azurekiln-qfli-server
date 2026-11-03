@@ -80,12 +80,25 @@ export function runVerify(run = execute) {
   for (const [command, args] of COMMANDS.verify) run(command, args);
 }
 
-export function runPublish({ platform, repository, ref, revision, env = process.env, run = execute, login = true }) {
+export function runPublish({ platform, repository, ref, revision, env = process.env, run = execute, login = true, steps = 'all' }) {
   if (!ref || !revision) throw new Error('Publishing needs --ref and --revision');
+  if (!['all', 'build', 'push'].includes(steps)) throw new Error('Steps must be all, build or push');
   const plan = imagePlan({ platform, repository, ref, revision, env });
-  runVerify(run);
-
   const source = `${plan.image}:${plan.tag}`;
+
+  if (steps === 'push') {
+    // The build step already pushed the commit tag, so only latest can be left.
+    if (!plan.latest) {
+      console.log(`${source} is a prerelease; latest stays untouched`);
+      return plan;
+    }
+    const latest = `${plan.image}:latest`;
+    run('docker', ['tag', source, latest]);
+    run('docker', ['push', latest]);
+    return plan;
+  }
+
+  if (steps === 'all') runVerify(run);
   if (login) {
     const user = env.CI_REGISTRY_USER || 'gitlab-ci-token';
     if (!env.CI_REGISTRY_PASSWORD) throw new Error('CI_REGISTRY_PASSWORD is required to publish');
@@ -97,6 +110,7 @@ export function runPublish({ platform, repository, ref, revision, env = process.
   }
   run('docker', ['build', '--pull', '--file', 'Dockerfile', '--tag', source, '.']);
   run('docker', ['push', source]);
+  if (steps === 'build') return plan;
   if (plan.latest) {
     const latest = `${plan.image}:latest`;
     run('docker', ['tag', source, latest]);
@@ -138,7 +152,8 @@ export function main(argv, env = process.env) {
     // keeps the credential in its own store; relogging in would need a secret
     // this script may not have.
     const login = options.noLogin !== 'true';
-    const plan = runPublish({ platform: options.platform, repository, ref: options.ref, revision, env, login });
+    const steps = options.steps || 'all';
+    const plan = runPublish({ platform: options.platform, repository, ref: options.ref, revision, env, login, steps });
     console.log(`Published ${plan.image}:${plan.tag}; latest=${plan.latest}`);
     return plan;
   }
