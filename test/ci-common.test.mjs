@@ -8,7 +8,7 @@ const revision = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0';
 
 test('CNB uses the repository slug from the platform', () => {
   const plan = imagePlan({ platform: 'cnb', repository: 'azurekiln/azurekiln-qfli-server', ref: 'refs/heads/main', revision });
-  assert.equal(plan.image, 'docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server');
+  assert.equal(plan.image, 'docker.cnb.cool/azurekiln/azurekiln-qfli-server');
   assert.equal(plan.tag, 'sha-a1b2c3d4e5f6');
   assert.equal(plan.latest, true);
 });
@@ -16,13 +16,13 @@ test('CNB uses the repository slug from the platform', () => {
 test('GitHub and GitLab images live in their own namespaces', () => {
   const github = imagePlan({ platform: 'github', repository: 'azurekiln2333/azurekiln-qfli-server', ref: 'refs/heads/main', revision });
   const gitlab = imagePlan({ platform: 'gitlab', repository: 'azurekiln-team/azurekiln-qfli-server', ref: 'refs/heads/main', revision });
-  assert.equal(github.image, 'ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server');
-  assert.equal(gitlab.image, 'registry.gitlab.com/azurekiln-team/azurekiln-qfli-server/qfli-server');
+  assert.equal(github.image, 'ghcr.io/azurekiln2333/azurekiln-qfli-server');
+  assert.equal(gitlab.image, 'registry.gitlab.com/azurekiln-team/azurekiln-qfli-server');
 });
 
 test('a mixed-case owner is lowercased for Docker', () => {
   const plan = imagePlan({ platform: 'gitlab', repository: 'AzureKiln-Team/Project', ref: 'refs/heads/main', revision });
-  assert.equal(plan.image, 'registry.gitlab.com/azurekiln-team/project/qfli-server');
+  assert.equal(plan.image, 'registry.gitlab.com/azurekiln-team/project');
 });
 
 test('the registry can be overridden for GitLab self-hosting', () => {
@@ -78,13 +78,13 @@ test('publish validates first, then logs in, builds, pushes and tags latest', ()
     login: false,
     run: (command, args) => calls.push(`${command} ${args.join(' ')}`),
   });
-  assert.equal(plan.image, 'registry.gitlab.com/team/app/qfli-server');
+  assert.equal(plan.image, 'registry.gitlab.com/team/app');
   assert.equal(calls[0], 'npm ci');
   assert.deepEqual(calls.slice(-4), [
-    'docker build --pull --file Dockerfile --tag registry.gitlab.com/team/app/qfli-server:sha-a1b2c3d4e5f6 .',
-    'docker push registry.gitlab.com/team/app/qfli-server:sha-a1b2c3d4e5f6',
-    'docker tag registry.gitlab.com/team/app/qfli-server:sha-a1b2c3d4e5f6 registry.gitlab.com/team/app/qfli-server:latest',
-    'docker push registry.gitlab.com/team/app/qfli-server:latest',
+    'docker build --pull --file Dockerfile --tag registry.gitlab.com/team/app:sha-a1b2c3d4e5f6 .',
+    'docker push registry.gitlab.com/team/app:sha-a1b2c3d4e5f6',
+    'docker tag registry.gitlab.com/team/app:sha-a1b2c3d4e5f6 registry.gitlab.com/team/app:latest',
+    'docker push registry.gitlab.com/team/app:latest',
   ]);
 });
 
@@ -134,8 +134,8 @@ test('--steps build skips the latest promotion and --steps push only moves lates
   });
   assert.equal(plan.latest, true);
   assert.deepEqual(push, [
-    'docker tag ghcr.io/o/r/qfli-server:sha-a1b2c3d4e5f6 ghcr.io/o/r/qfli-server:latest',
-    'docker push ghcr.io/o/r/qfli-server:latest',
+    'docker tag ghcr.io/o/r:sha-a1b2c3d4e5f6 ghcr.io/o/r:latest',
+    'docker push ghcr.io/o/r:latest',
   ]);
 });
 

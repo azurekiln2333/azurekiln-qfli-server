@@ -4,7 +4,7 @@
 # a Docker socket. Update scope `qfli-server` is independent of the terminal stack.
 services:
   server:
-    image: "${QFLI_SERVER_IMAGE:-docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server:latest}"
+    image: "${QFLI_SERVER_IMAGE:-docker.cnb.cool/azurekiln/azurekiln-qfli-server:latest}"
     restart: unless-stopped
     init: true
     network_mode: host

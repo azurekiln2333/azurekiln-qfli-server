@@ -20,11 +20,12 @@ const IDENTIFIER = `(?:${NUMBER}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)`;
 const SEMVER = new RegExp(`^v${NUMBER}\\.${NUMBER}\\.${NUMBER}(?:-${IDENTIFIER}(?:\\.${IDENTIFIER})*)?$`);
 
 // Each platform keeps its own namespace so a hijacked pipeline cannot
-// overwrite another platform's image.
+// overwrite another platform's image. The image is the repository path itself;
+// CI_IMAGE_NAME appends a sub-name only when a pipeline sets one.
 const PLATFORMS = {
-  cnb: { registry: 'docker.cnb.cool', repository: null, name: 'qfli-server' },
-  github: { registry: 'ghcr.io', repository: 'github.repository', name: 'qfli-server' },
-  gitlab: { registry: 'registry.gitlab.com', repository: 'CI_PROJECT_PATH', name: 'qfli-server' },
+  cnb: { registry: 'docker.cnb.cool', repository: null },
+  github: { registry: 'ghcr.io', repository: 'github.repository' },
+  gitlab: { registry: 'registry.gitlab.com', repository: 'CI_PROJECT_PATH' },
 };
 
 const COMMANDS = {
@@ -50,11 +51,11 @@ export function imagePlan({ platform, repository, ref, revision, env = {} }) {
   if (!new RegExp(`^${PART}(?:/${PART})+$`, 'i').test(repository || '')) {
     throw new Error('Registry repository path is missing or malformed');
   }
-  const name = env.CI_IMAGE_NAME || known.name;
-  if (!new RegExp(`^${PART}$`).test(name)) throw new Error('Image name is malformed');
+  const name = env.CI_IMAGE_NAME || '';
+  if (name && !new RegExp(`^${PART}$`).test(name)) throw new Error('Image name is malformed');
   if (!/^[a-f0-9]{7,40}$/.test(revision || '')) throw new Error('Invalid commit revision');
   const hash = env.CI_COMMIT_SHORT || revision.slice(0, 12);
-  const image = `${host}/${dockerName(repository)}/${name}`;
+  const image = `${host}/${dockerName(repository)}${name ? `/${name}` : ''}`;
 
   if (ref === 'refs/heads/main') return { image, tag: `sha-${hash}`, latest: true, mode: 'main' };
   if (!ref.startsWith('refs/tags/')) throw new Error('Publishing is limited to main and v* tags');

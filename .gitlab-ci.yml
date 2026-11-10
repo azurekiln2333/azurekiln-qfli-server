@@ -6,8 +6,8 @@
 # a pipeline already writes to this project's container registry, so no CI/CD
 # variable has to be configured by hand.
 #
-# Images go to ${CI_REGISTRY}/${CI_REGISTRY_PATH}/qfli-server, for example
-# registry.gitlab.com/azurekiln-team/azurekiln-qfli-server/qfli-server.
+# Images go to ${CI_REGISTRY}/${CI_REGISTRY_PATH}, for example
+# registry.gitlab.com/azurekiln-team/azurekiln-qfli-server.
 # Merge requests validate only; they never push images.
 stages:
   - verify
@@ -17,8 +17,6 @@ variables:
   NODE_IMAGE: node:24.15.0-bookworm
   DOCKER_IMAGE: docker:28.6.1-cli
   DOCKER_DIND_IMAGE: docker:28.6.1-dind
-  # The shared script refuses anything that is not main or a v* tag.
-  CI_IMAGE_NAME: qfli-server
 
 default:
   interruptible: true

@@ -360,7 +360,7 @@ AI 响应固定带 `aiGenerated: true`。
 
 业务后端与终端执行器分别发布镜像。服务器只拉取预构建镜像。服务器不现场构建。
 
-默认镜像为 `docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server:latest`，
+默认镜像为 `docker.cnb.cool/azurekiln/azurekiln-qfli-server:latest`，
 由 CNB 流水线发布。镜像路径由仓库路径决定，见 `.cnb.yml` 与 `scripts/ci-common.mjs`。
 
 部署目录只放 `docker-compose.yaml`、`.env` 与 `data/`：
@@ -405,9 +405,9 @@ docker compose up -d server
 
 | 平台 | 校验 | 发布镜像 | 镜像地址 | 配置文件 |
 | --- | --- | --- | --- | --- |
-| CNB | 是 | 是 | `docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server` | `.cnb.yml` |
-| GitHub Actions | 是 | 是 | `ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server` | `.github/workflows/build-and-push.yml` |
-| GitLab CI | 是 | 是 | `registry.gitlab.com/azurekiln-team/azurekiln-qfli-server/qfli-server` | `.gitlab-ci.yml` |
+| CNB | 是 | 是 | `docker.cnb.cool/azurekiln/azurekiln-qfli-server` | `.cnb.yml` |
+| GitHub Actions | 是 | 是 | `ghcr.io/azurekiln2333/azurekiln-qfli-server` | `.github/workflows/build-and-push.yml` |
+| GitLab CI | 是 | 是 | `registry.gitlab.com/azurekiln-team/azurekiln-qfli-server` | `.gitlab-ci.yml` |
 | GitCode / AtomGit | 是 | 否 | 无 | `.gitcode/workflows/verify.yml` |
 | Gitee | 否 | 否 | 无 | 无 |
 
@@ -420,7 +420,7 @@ Gitee 的免费云构建只面向企业账户，GitCode 缺少公开的托管镜
 改镜像来源时只改环境变量，不改 compose 默认值：
 
 ```sh
-QFLI_SERVER_IMAGE=ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server:latest
+QFLI_SERVER_IMAGE=ghcr.io/azurekiln2333/azurekiln-qfli-server:latest
 ```
 
 ### 多执行节点

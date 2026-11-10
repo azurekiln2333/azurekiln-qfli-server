@@ -68,7 +68,7 @@ for (const key of requiredEmpty) {
   require(new RegExp(`^${key}=$`, 'm').test(envExample), `.env.example must list ${key} with an empty value`);
 }
 // The compose file reads these; a missing key makes the default image unset.
-require(/^QFLI_SERVER_IMAGE=docker\.cnb\.cool\/azurekiln\/azurekiln-qfli-server\/qfli-server:latest$/m.test(envExample),
+require(/^QFLI_SERVER_IMAGE=docker\.cnb\.cool\/azurekiln\/azurekiln-qfli-server:latest$/m.test(envExample),
   '.env.example must name the default CNB image');
 for (const key of ['QFLI_SERVER_WATCHTOWER_IMAGE', 'WATCHTOWER_POLL_INTERVAL', 'QFLI_SERVER_MEMORY', 'QFLI_SERVER_CPUS', 'QFLI_SERVER_UID', 'QFLI_SERVER_GID']) {
   require(new RegExp(`^${key}=`, 'm').test(envExample), `.env.example must list the compose setting ${key}`);
@@ -76,12 +76,13 @@ for (const key of ['QFLI_SERVER_WATCHTOWER_IMAGE', 'WATCHTOWER_POLL_INTERVAL', '
 require(/^TERMINAL_RATE_LIMIT=/m.test(envExample), '.env.example must list TERMINAL_RATE_LIMIT');
 
 // The compose default and the image the CNB pipeline publishes must agree.
-require(/docker\.cnb\.cool\/azurekiln\/azurekiln-qfli-server\/qfli-server:latest/.test(compose),
+require(/docker\.cnb\.cool\/azurekiln\/azurekiln-qfli-server:latest/.test(compose),
   'the default compose image must be the published CNB image');
 require(!/qflistudio-next/.test(compose), 'the retired qflistudio-next image path must be gone');
 
 require(/CNB_REPO_SLUG_LOWERCASE/.test(ci), 'CI must namespace the image by the CNB repository slug');
-require(/qfli-server/.test(ci), 'CI must publish the qfli-server image name');
+require(!/CI_IMAGE_NAME/.test(ci), 'the CNB image is the repository path, without a sub-name');
+require(!/azurekiln-qfli-server\/qfli-server/.test(compose + envExample), 'the retired azurekiln-qfli-server/qfli-server image path must be gone');
 require(/services:\s*\n\s*- docker/.test(ci), 'CI image pipeline needs the docker service');
 // Every CNB job that runs node must pin an image that actually has node. The
 // platform default build image does not, which fails with `node: command not

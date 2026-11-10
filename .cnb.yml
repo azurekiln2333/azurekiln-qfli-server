@@ -2,8 +2,8 @@
 # Validation and publishing both live in scripts/ci-common.mjs, so CNB,
 # GitHub Actions and GitLab CI cannot drift apart.
 #
-# Image namespace follows the CNB rule docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}/<name>,
-# which gives docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server.
+# The image is the CNB same-name artifact docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE},
+# which gives docker.cnb.cool/azurekiln/azurekiln-qfli-server.
 #
 # Every job here runs `node`, so every job pins node:24.15.0-bookworm. The CNB
 # default build image has no Node and fails with `node: command not found`.

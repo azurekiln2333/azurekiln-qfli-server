@@ -7,9 +7,9 @@
 
 | 平台 | 校验 | 发布镜像 | 镜像地址 | 配置来源 |
 | --- | --- | --- | --- | --- |
-| CNB | 有 | 有 | `docker.cnb.cool/azurekiln/azurekiln-qfli-server/qfli-server` | `.cnb.yml` + 平台自带登录 |
-| GitHub | 有 | 有 | `ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server` | `.github/workflows/build-and-push.yml` + `GITHUB_TOKEN` |
-| GitLab | 有 | 有 | `registry.gitlab.com/azurekiln-team/azurekiln-qfli-server/qfli-server` | `.gitlab-ci.yml` + 预置变量 |
+| CNB | 有 | 有 | `docker.cnb.cool/azurekiln/azurekiln-qfli-server` | `.cnb.yml` + 平台自带登录 |
+| GitHub | 有 | 有 | `ghcr.io/azurekiln2333/azurekiln-qfli-server` | `.github/workflows/build-and-push.yml` + `GITHUB_TOKEN` |
+| GitLab | 有 | 有 | `registry.gitlab.com/azurekiln-team/azurekiln-qfli-server` | `.gitlab-ci.yml` + 预置变量 |
 | Gitee | 无 | 无 | 无 | 免费云构建不覆盖个人仓库 |
 | GitCode | 有 | 无 | 无 | `.gitcode/workflows/verify.yml` |
 
@@ -18,7 +18,7 @@
 ## CNB
 
 `.cnb.yml` 的发布任务读取 `CNB_REPO_SLUG_LOWERCASE`、`CNB_COMMIT`、`CNB_BRANCH`，
-镜像名前缀由仓库路径决定，因此镜像地址为 `docker.cnb.cool/<仓库路径>/qfli-server`。
+镜像地址就是仓库路径，即 `docker.cnb.cool/<仓库路径>`。
 
 `services: [docker]` 会注入 Docker daemon，并**自动 `docker login` 到 `docker.cnb.cool`**，
 因此发布步骤传 `--no-login`。CNB 只提供 `CNB_TOKEN`，不提供 `CI_REGISTRY_PASSWORD`，
@@ -89,8 +89,8 @@ GHCR 包默认继承仓库可见性。公开仓库对应公开包，服务器可
 生产服务器只拉取 CNB 镜像。换注册表时改 `QFLI_SERVER_IMAGE`，不要改 `docker-compose.yaml` 的默认值：
 
 ```sh
-QFLI_SERVER_IMAGE=ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server:latest
-QFLI_SERVER_IMAGE=registry.gitlab.com/azurekiln-team/azurekiln-qfli-server/qfli-server:latest
+QFLI_SERVER_IMAGE=ghcr.io/azurekiln2333/azurekiln-qfli-server:latest
+QFLI_SERVER_IMAGE=registry.gitlab.com/azurekiln-team/azurekiln-qfli-server:latest
 ```
 
 Watchtower 只更新带 `com.centurylinklabs.watchtower.scope=qfli-server` 标签的容器，

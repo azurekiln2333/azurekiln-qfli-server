@@ -2,7 +2,7 @@
 # steps have one definition: scripts/ci-common.mjs.
 #
 # Images go to GHCR under the repository owner, for example
-# ghcr.io/azurekiln2333/azurekiln-qfli-server/qfli-server.
+# ghcr.io/azurekiln2333/azurekiln-qfli-server.
 # GITHUB_TOKEN needs `packages: write`; no extra secret is required.
 # Pull requests validate only; they never push images.
 name: Verify and publish image
