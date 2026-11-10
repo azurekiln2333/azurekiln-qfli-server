@@ -336,9 +336,15 @@ SQL 沙箱，一律 403 `realname.required`，客户端引导走华为账号绑�
 
 ### AI 与联网工具
 
-`QFLI_AI_BASE_URL` 线上只允许指向 DeepSeek 官方接口，不得改为第三方聚合网关，
-因为第三方清单只披露了深度求索。AI 响应固定带 `aiGenerated: true`，供客户端显示
-"内容由 AI 生成"。
+后端只需配置 `QFLI_AI_BASE_URL` 和 `QFLI_AI_API_KEY`。
+后端通过标准 `GET /v1/models` 获取模型列表。
+`GET /api/ai/models` 向已登录客户端返回列表。
+聊天请求可携带列表中的 `model`。
+旧客户端未指定模型时，后端使用第一个模型。
+后端不再读取 `QFLI_AI_MODEL`。
+配置示例和接口约定见 [AI 模型发现](deploy/ai-models.md)。
+AI 响应固定带 `aiGenerated: true`。
+客户端据此显示“内容由 AI 生成”。
 `POST /api/ai/web_search` 已下线（搜索走 Bing，属未披露的第三方），`src/web-search.js` 已删除；
 `POST /api/ai/web_fetch` 保留并继续执行 SSRF 守卫。
 

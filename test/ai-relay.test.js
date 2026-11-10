@@ -1,4 +1,4 @@
-// AI 转接的聚焦测试：固定配置、严格输入、工具往返、超时/取消/限流与脱敏错误。
+// AI 转接测试：模型发现、工具往返、超时、取消、限流与错误脱敏。
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
@@ -11,6 +11,10 @@ require.cache[utilPath] = {
   id: utilPath, filename: utilPath, loaded: true,
   exports: {
     authRequired(req, _res, next) {
+      if (req.get('x-test-user') === 'unauthenticated') {
+        _res.status(401).json({ error: '未登录' });
+        return;
+      }
       req.userId = req.get('x-test-user') || userId;
       req.user = { id: req.userId, username: 'test', is_admin: false };
       next();
@@ -41,8 +45,12 @@ for (const layer of router.stack) {
 }
 
 const API_KEY = 'key-server-side-secret';
+const TEST_MODEL = 'provider/coder:latest';
+const CATALOG = { object: 'list', data: [
+  { id: TEST_MODEL, object: 'model', created: 0, owned_by: 'provider' },
+  { id: 'other/chat-model', object: 'model', created: 1, owned_by: 'other' },
+] };
 process.env.QFLI_AI_API_KEY = API_KEY;
-process.env.QFLI_AI_MODEL = 'deepseek-v4.1-flash';
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -53,9 +61,16 @@ function readBody(req) {
   });
 }
 
-function startUpstream(handler) {
+function startUpstream(handler, { catalog = CATALOG } = {}) {
   return new Promise(resolve => {
-    const server = http.createServer(handler);
+    const server = http.createServer((req, res) => {
+      if (catalog !== null && req.method === 'GET' && req.url === '/v1/models') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify(catalog));
+        return;
+      }
+      handler(req, res);
+    });
     server.listen(0, '127.0.0.1', () => {
       resolve({
         server,
@@ -102,7 +117,8 @@ test.beforeEach(() => {
   process.env.QFLI_AI_RATE_LIMIT = '100';
   process.env.QFLI_AI_CONCURRENCY = '4';
   process.env.QFLI_AI_MAX_INFLIGHT = '16';
-  process.env.QFLI_AI_MODEL = 'deepseek-v4.1-flash';
+  process.env.QFLI_AI_API_KEY = API_KEY;
+  delete process.env.QFLI_AI_MODEL;
 });
 
 async function post(payload, user = userId) {
@@ -115,7 +131,214 @@ async function post(payload, user = userId) {
   return { status: response.status, body: await response.json() };
 }
 
-test('tool round trip keeps tool_calls and fixes the model', async () => {
+async function getModels(user = userId) {
+  const response = await fetch(`${appBase}/api/ai/models`, {
+    headers: { 'x-test-user': user }, signal: AbortSignal.timeout(10000),
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+test('models route uses authenticated standard discovery and strips extra fields', async t => {
+  let requests = 0;
+  const upstream = await startUpstream((req, res) => {
+    requests += 1;
+    assert.equal(req.method, 'GET');
+    assert.equal(req.url, '/proxy/v1/models');
+    assert.equal(req.headers.authorization, `Bearer ${API_KEY}`);
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ ...CATALOG, secret: API_KEY, data: [
+      { ...CATALOG.data[0], secret: API_KEY }, CATALOG.data[0], CATALOG.data[1],
+    ] }));
+  }, { catalog: null });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = `${upstream.base}/proxy/v1/`;
+  assert.equal((await getModels('unauthenticated')).status, 401);
+  assert.equal((await post({ messages: [{ role: 'user', content: 'hi' }] },
+    'unauthenticated')).status, 401);
+  assert.equal(requests, 0);
+  const result = await getModels();
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, CATALOG);
+  assert.ok(!JSON.stringify(result.body).includes(API_KEY));
+  await getModels();
+  assert.equal(requests, 1, 'successful catalogs are cached');
+});
+
+test('chat accepts a discovered model and rejects unknown or malformed IDs', async t => {
+  let seen;
+  let chats = 0;
+  const upstream = await startUpstream(async (req, res) => {
+    chats += 1;
+    seen = JSON.parse(await readBody(req));
+    assert.equal(req.url, '/v1/chat/completions');
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+  });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  const messages = [{ role: 'user', content: 'hi' }];
+  const chosen = CATALOG.data[1].id;
+  const result = await post({ messages, model: chosen });
+  assert.equal(result.status, 200);
+  assert.equal(seen.model, chosen);
+  assert.equal(result.body.model, chosen);
+  for (const model of ['not-listed', '', null, 123, 'bad\nmodel', 'x'.repeat(257)]) {
+    assert.equal((await post({ messages, model })).status, 400);
+  }
+  assert.equal(chats, 1, 'invalid model choices never start a completion');
+});
+
+test('model cache expires and is isolated by root and key', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1800000000000 });
+  let requests = 0;
+  const first = await startUpstream((req, res) => {
+    requests += 1;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: [{ id: req.headers.authorization === `Bearer ${API_KEY}`
+      ? `model-${requests}` : 'other-key-model' }] }));
+  }, { catalog: null });
+  const second = await startUpstream((_req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: [{ id: 'other-root-model' }] }));
+  }, { catalog: null });
+  t.after(first.close);
+  t.after(second.close);
+  process.env.QFLI_AI_BASE_URL = first.base;
+  assert.equal((await getModels()).body.data[0].id, 'model-1');
+  t.mock.timers.tick(59999);
+  assert.equal((await getModels()).body.data[0].id, 'model-1');
+  t.mock.timers.tick(1);
+  assert.equal((await getModels()).body.data[0].id, 'model-2');
+  process.env.QFLI_AI_API_KEY = 'different-server-key';
+  assert.equal((await getModels()).body.data[0].id, 'other-key-model');
+  process.env.QFLI_AI_BASE_URL = second.base;
+  assert.equal((await getModels()).body.data[0].id, 'other-root-model');
+  assert.equal(requests, 3);
+});
+
+test('discovery failures are sanitized, never cached, and block completions', async t => {
+  let requests = 0;
+  let chats = 0;
+  let status = 401;
+  const upstream = await startUpstream((req, res) => {
+    if (req.method === 'POST') chats += 1;
+    requests += 1;
+    res.statusCode = status;
+    res.setHeader('content-type', 'application/json');
+    res.end(status === 200 ? JSON.stringify(CATALOG) : JSON.stringify({ error: API_KEY }));
+  }, { catalog: null });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  const result = await getModels();
+  assert.equal(result.status, 502);
+  assert.equal(result.body.error, 'AI 服务凭据无效');
+  assert.ok(!JSON.stringify(result).includes(API_KEY));
+  assert.equal((await post({ messages: [{ role: 'user', content: 'hi' }] })).status, 502);
+  assert.equal(requests, 2);
+  assert.equal(chats, 0);
+  status = 200;
+  assert.equal((await getModels()).status, 200);
+  assert.equal(requests, 3);
+});
+
+test('empty catalog is reported without inventing a fallback model', async t => {
+  let chats = 0;
+  const upstream = await startUpstream((_req, res) => {
+    chats += 1;
+    res.end('{}');
+  }, { catalog: { object: 'list', data: [] } });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  process.env.QFLI_AI_MODEL = 'legacy-model-must-not-be-used';
+  assert.deepEqual((await getModels()).body, { object: 'list', data: [] });
+  const result = await post({ messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(result.status, 503);
+  assert.match(result.body.error, /没有可用模型/);
+  assert.equal(chats, 0);
+});
+
+test('invalid and oversized model catalogs are rejected', async t => {
+  for (const catalog of [{}, { data: null }, { data: [{}] }, { data: [{ id: '' }] },
+    { data: [{ id: 'bad\nmodel' }] }, { data: Array(4097).fill({ id: 'a' }) },
+    { data: [{ id: 'ok', extra: 'x'.repeat(2 * 1024 * 1024) }] }]) {
+    const upstream = await startUpstream((_req, res) => res.end('{}'), { catalog });
+    t.after(upstream.close);
+    process.env.QFLI_AI_BASE_URL = upstream.base;
+    assert.equal((await getModels()).status, 502);
+  }
+});
+
+test('model discovery times out and releases concurrency for a retry', async t => {
+  let requests = 0;
+  let canceled;
+  const canceledPromise = new Promise(resolve => { canceled = resolve; });
+  const upstream = await startUpstream((_req, res) => {
+    requests += 1;
+    if (requests === 1) { res.once('close', canceled); return; }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(CATALOG));
+  }, { catalog: null });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  process.env.QFLI_AI_TIMEOUT_MS = '150';
+  process.env.QFLI_AI_CONCURRENCY = '1';
+  assert.equal((await getModels()).status, 504);
+  await canceledPromise;
+  assert.equal((await getModels()).status, 200);
+});
+
+test('disconnect during discovery cancels upstream and blocks completion', async t => {
+  let received;
+  const receivedPromise = new Promise(resolve => { received = resolve; });
+  let canceled;
+  const canceledPromise = new Promise(resolve => { canceled = resolve; });
+  let requests = 0;
+  const upstream = await startUpstream((_req, res) => {
+    requests += 1;
+    received();
+    res.once('close', canceled);
+  }, { catalog: null });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  const controller = new AbortController();
+  const pending = fetch(`${appBase}/api/ai/chat`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-test-user': userId },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+    signal: controller.signal,
+  }).catch(error => error);
+  await receivedPromise;
+  controller.abort();
+  assert.equal((await pending).name, 'AbortError');
+  await canceledPromise;
+  assert.equal(requests, 1);
+});
+
+test('cached model lists still require authentication and rate admission', async t => {
+  const upstream = await startUpstream((_req, res) => res.end('{}'));
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  process.env.QFLI_AI_RATE_LIMIT = '1';
+  assert.equal((await getModels()).status, 200);
+  assert.equal((await getModels('unauthenticated')).status, 401);
+  assert.equal((await getModels()).status, 429);
+});
+
+test('model discovery does not follow redirects with the upstream credential', async t => {
+  let leaked = 0;
+  const destination = await startUpstream((_req, res) => { leaked += 1; res.end('{}'); },
+    { catalog: null });
+  const upstream = await startUpstream((_req, res) => {
+    res.writeHead(302, { location: `${destination.base}/v1/models` });
+    res.end();
+  }, { catalog: null });
+  t.after(destination.close);
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  assert.equal((await getModels()).status, 503);
+  assert.equal(leaked, 0);
+});
+
+test('tool round trip discovers a default model with only root and key', async () => {
   let seen;
   let authorization;
   const upstream = await startUpstream(async (req, res) => {
@@ -144,7 +367,7 @@ test('tool round trip keeps tool_calls and fixes the model', async () => {
 
   const { status, body } = await post({ messages, tools });
   assert.equal(status, 200);
-  assert.equal(body.model, 'deepseek-v4.1-flash');
+  assert.equal(body.model, TEST_MODEL);
   // 客户端据此显示“内容由 AI 生成”标识。
   assert.equal(body.aiGenerated, true);
   assert.deepEqual(body.message, {
@@ -155,7 +378,7 @@ test('tool round trip keeps tool_calls and fixes the model', async () => {
   });
   assert.deepEqual(body.usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
   assert.equal(authorization, `Bearer ${API_KEY}`);
-  assert.equal(seen.model, 'deepseek-v4.1-flash');
+  assert.equal(seen.model, TEST_MODEL);
   assert.deepEqual(seen.messages, messages);
   assert.deepEqual(seen.tools, tools);
   assert.equal(seen.stream, undefined);
@@ -265,7 +488,7 @@ test('upstream no-call shapes without text are rejected', async () => {
   }
 });
 
-test('client cannot override address, key, model or streaming', async () => {
+test('client cannot override address, key or streaming', async () => {
   let requests = 0;
   const upstream = await startUpstream(async (req, res) => {
     requests += 1;
@@ -275,7 +498,7 @@ test('client cannot override address, key, model or streaming', async () => {
   });
   process.env.QFLI_AI_BASE_URL = upstream.base;
   for (const extra of [
-    { model: 'gpt-4o' }, { stream: true }, { temperature: 1 },
+    { stream: true }, { temperature: 1 },
     { apiKey: 'x' }, { base_url: 'https://evil.example' }, { tool_choice: 'auto' },
   ]) {
     const { status } = await post({ messages: [{ role: 'user', content: 'hi' }], ...extra });
@@ -285,13 +508,18 @@ test('client cannot override address, key, model or streaming', async () => {
   await upstream.close();
 });
 
-test('configuration fixes endpoint, https requirement and defaults', async () => {
+test('configuration normalizes both endpoints and ignores legacy model setting', async () => {
   const upstream = await startUpstream(async (req, res) => { await readBody(req); res.end('{}'); });
   process.env.QFLI_AI_BASE_URL = upstream.base;
   assert.equal(ai.configuration().endpoint, `${upstream.base}/v1/chat/completions`);
+  assert.equal(ai.configuration().modelsEndpoint, `${upstream.base}/v1/models`);
   process.env.QFLI_AI_BASE_URL = `${upstream.base}/v1`;
   assert.equal(ai.configuration().endpoint, `${upstream.base}/v1/chat/completions`);
-  assert.equal(ai.configuration().model, 'deepseek-v4.1-flash');
+  assert.equal(ai.configuration().modelsEndpoint, `${upstream.base}/v1/models`);
+  assert.equal(ai.configuration().model, undefined);
+  process.env.QFLI_AI_BASE_URL = `${upstream.base}/proxy/v1/`;
+  assert.equal(ai.configuration().modelsEndpoint, `${upstream.base}/proxy/v1/models`);
+  assert.equal(ai.configuration().endpoint, `${upstream.base}/proxy/v1/chat/completions`);
 
   const savedBase = process.env.QFLI_AI_BASE_URL;
   process.env.QFLI_AI_BASE_URL = 'http://example.com';
@@ -300,8 +528,8 @@ test('configuration fixes endpoint, https requirement and defaults', async () =>
   assert.throws(() => ai.configuration(), { status: 503 });
   process.env.QFLI_AI_BASE_URL = savedBase;
   process.env.QFLI_AI_MODEL = 'bad model!';
-  assert.throws(() => ai.configuration(), { status: 503 });
-  process.env.QFLI_AI_MODEL = 'deepseek-v4.1-flash';
+  assert.equal(ai.configuration().model, undefined);
+  delete process.env.QFLI_AI_MODEL;
   const savedKey = process.env.QFLI_AI_API_KEY;
   process.env.QFLI_AI_API_KEY = '';
   assert.throws(() => ai.configuration(), { status: 503 });

@@ -1,9 +1,10 @@
-// AI 编程助手转接：上游地址、密钥和模型只由服务端环境变量决定。
-// 客户端只能提交 OpenAI 兼容的消息和工具定义，不能覆盖模型或连接参数。
+// AI 转接：服务端配置上游地址和密钥。
+// 模型来自上游标准列表，客户端可从列表中选择。
 const { ApiError } = require('./gateway');
 const { log, stage } = require('./logging');
 
-const DEFAULT_MODEL = 'deepseek-v4.1-flash';
+const MODELS_CACHE_MS = 60 * 1000;
+const MAX_MODELS = 4096;
 const MAX_REQUEST_BYTES = 512 * 1024;
 const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_ARGUMENT_BYTES = 256 * 1024;
@@ -44,9 +45,7 @@ function limits() {
 function configuration() {
   const base = (process.env.QFLI_AI_BASE_URL || '').trim();
   const key = (process.env.QFLI_AI_API_KEY || '').trim();
-  const model = (process.env.QFLI_AI_MODEL || DEFAULT_MODEL).trim();
   if (!base || !key) throw new ApiError(503, 'AI 服务未配置');
-  if (!NAME_PATTERN.test(model)) throw new ApiError(503, 'AI 模型名称无效');
   let url;
   try { url = new URL(base); } catch { throw new ApiError(503, 'AI 服务地址无效'); }
   const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
@@ -55,8 +54,15 @@ function configuration() {
     throw new ApiError(503, 'AI 服务地址需要 HTTPS');
   }
   const prefix = url.pathname.replace(/\/+$/, '');
-  const endpoint = `${url.origin}${/\/v1$/.test(prefix) ? prefix : `${prefix}/v1`}/chat/completions`;
-  return { endpoint, key, model, ...limits() };
+  const apiBase = `${url.origin}${/\/v1$/.test(prefix) ? prefix : `${prefix}/v1`}`;
+  return { endpoint: `${apiBase}/chat/completions`, modelsEndpoint: `${apiBase}/models`,
+    key, ...limits() };
+}
+
+// Model IDs are opaque upstream identifiers, including provider/name and tags.
+function validModelId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256 &&
+    !/[\s\x00-\x1f\x7f]/.test(value);
 }
 
 function validateToolCalls(list, status, { allowIndex = false } = {}) {
@@ -169,17 +175,22 @@ function validateTools(tools) {
 }
 
 function validateRequest(value) {
-  if (!isPlainObject(value) || !onlyKeys(value, ['messages', 'tools']) ||
+  if (!isPlainObject(value) || !onlyKeys(value, ['messages', 'tools', 'model']) ||
       !Array.isArray(value.messages) || value.messages.length < 1 || value.messages.length > MAX_MESSAGES) {
     throw new ApiError(400, 'AI 请求无效或消息数量超过 100 条');
   }
   const messages = value.messages.map(validateMessage);
   const tools = validateTools(value.tools);
-  const serialized = JSON.stringify({ messages, ...(tools === undefined ? {} : { tools }) });
+  if ('model' in value && !validModelId(value.model)) {
+    throw new ApiError(400, 'AI 模型 ID 无效');
+  }
+  const request = { messages, ...(tools === undefined ? {} : { tools }),
+    ...('model' in value ? { model: value.model } : {}) };
+  const serialized = JSON.stringify(request);
   if (Buffer.byteLength(serialized) > MAX_REQUEST_BYTES) {
     throw new ApiError(413, 'AI 请求超过 512 KiB 限额');
   }
-  return { messages, ...(tools === undefined ? {} : { tools }) };
+  return request;
 }
 
 // 每用户限流和并发，另设全服务在途上限保护小主机。
@@ -246,6 +257,51 @@ async function boundedJson(response) {
   }
 }
 
+let modelsCache = null;
+
+function modelList(data) {
+  if (!isPlainObject(data) || !Array.isArray(data.data) || data.data.length > MAX_MODELS) {
+    throw new ApiError(502, 'AI 模型列表格式无效');
+  }
+  const seen = new Set();
+  const models = [];
+  for (const entry of data.data) {
+    if (!isPlainObject(entry) || !validModelId(entry.id)) {
+      throw new ApiError(502, 'AI 模型列表格式无效');
+    }
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const model = { id: entry.id, object: 'model' };
+    if (Number.isSafeInteger(entry.created) && entry.created >= 0) model.created = entry.created;
+    if (typeof entry.owned_by === 'string' && entry.owned_by.length <= 256 &&
+        !/[\x00-\x1f\x7f]/.test(entry.owned_by)) model.owned_by = entry.owned_by;
+    models.push(model);
+  }
+  return { object: 'list', data: models };
+}
+
+async function fetchModels(config, signal, requestId) {
+  // Bind cached data to both endpoint and credential; never reuse another key's catalog.
+  if (modelsCache?.endpoint === config.modelsEndpoint && modelsCache.key === config.key &&
+      modelsCache.expiresAt > Date.now()) return modelsCache.data;
+  const response = await fetch(config.modelsEndpoint, {
+    method: 'GET',
+    redirect: 'error',
+    signal,
+    headers: { authorization: `Bearer ${config.key}`, accept: 'application/json',
+      ...(requestId ? { 'X-Request-Id': requestId } : {}) },
+  });
+  if (!response.ok) {
+    try { await response.body?.cancel(); } catch (_) { /* Ignore cancellation failures. */ }
+    throw upstreamError(response.status);
+  }
+  const data = modelList(await boundedJson(response));
+  signal.throwIfAborted();
+  modelsCache = { endpoint: config.modelsEndpoint, key: config.key,
+    expiresAt: Date.now() + MODELS_CACHE_MS, data };
+  return data;
+}
+
 function usageData(value) {
   if (!isPlainObject(value)) return undefined;
   const usage = {};
@@ -297,13 +353,10 @@ function resultData(data, model) {
   return result;
 }
 
-async function chat(body, { req, res } = {}) {
-  const config = configuration();
-  const request = validateRequest(body);
+async function withRequest(config, { req, res }, operation) {
   if (!req || typeof req.userId !== 'string') throw new ApiError(401, '未登录或登录已过期');
   admit(req.userId);
 
-  stage('ai.dispatch');
   const started = Date.now();
   const controller = new AbortController();
   let timedOut = false;
@@ -314,34 +367,8 @@ async function chat(body, { req, res } = {}) {
   if (req?.aborted || res?.destroyed) controller.abort();
 
   try {
-    const response = await fetch(config.endpoint, {
-      method: 'POST',
-      redirect: 'error',
-      signal: controller.signal,
-      headers: {
-        authorization: `Bearer ${config.key}`,
-        'content-type': 'application/json',
-        accept: 'application/json',
-        ...(req.requestId ? { 'X-Request-Id': req.requestId } : {}),
-      },
-      body: JSON.stringify({
-        model: config.model,
-        messages: request.messages,
-        ...(request.tools === undefined ? {} : { tools: request.tools }),
-      }),
-    });
-    log('ai.response', {
-      status: response.status,
-      model: config.model,
-      messages: request.messages.length,
-      tools: request.tools?.length || 0,
-      durationMs: Date.now() - started,
-    });
-    if (!response.ok) {
-      try { await response.body?.cancel(); } catch (_) { /* 忽略取消失败 */ }
-      throw upstreamError(response.status);
-    }
-    return resultData(await boundedJson(response), config.model);
+    controller.signal.throwIfAborted();
+    return await operation(controller.signal);
   } catch (error) {
     if (error instanceof ApiError) throw error;
     const aborted = controller.signal.aborted;
@@ -365,15 +392,59 @@ async function chat(body, { req, res } = {}) {
   }
 }
 
+async function models(context = {}) {
+  const config = configuration();
+  stage('ai.models');
+  return withRequest(config, context, signal => fetchModels(config, signal, context.req.requestId));
+}
+
+async function chat(body, context = {}) {
+  const config = configuration();
+  const request = validateRequest(body);
+  stage('ai.dispatch');
+  return withRequest(config, context, async signal => {
+    const catalog = await fetchModels(config, signal, context.req.requestId);
+    // Old clients omit model. Use the upstream order without a provider-specific name.
+    const model = request.model ?? catalog.data[0]?.id;
+    if (!model) throw new ApiError(503, 'AI 服务没有可用模型');
+    if (!catalog.data.some(entry => entry.id === model)) {
+      throw new ApiError(400, '所选 AI 模型不可用，请刷新模型列表');
+    }
+    const started = Date.now();
+    const response = await fetch(config.endpoint, {
+      method: 'POST',
+      redirect: 'error',
+      signal,
+      headers: {
+        authorization: `Bearer ${config.key}`,
+        'content-type': 'application/json',
+        accept: 'application/json',
+        ...(context.req.requestId ? { 'X-Request-Id': context.req.requestId } : {}),
+      },
+      body: JSON.stringify({ model, messages: request.messages,
+        ...(request.tools === undefined ? {} : { tools: request.tools }) }),
+    });
+    log('ai.response', { status: response.status, model, messages: request.messages.length,
+      tools: request.tools?.length || 0, durationMs: Date.now() - started });
+    if (!response.ok) {
+      try { await response.body?.cancel(); } catch (_) { /* 忽略取消失败 */ }
+      throw upstreamError(response.status);
+    }
+    return resultData(await boundedJson(response), model);
+  });
+}
+
 function resetLimits() {
   active.clear();
   windows.clear();
   inflight = 0;
+  modelsCache = null;
 }
 
 module.exports = {
   configuration,
   validateRequest,
+  models,
   chat,
   _resetLimits: resetLimits,
 };

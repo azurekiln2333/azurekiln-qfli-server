@@ -55,7 +55,7 @@ app.get('/api/health', (_req, res) =>
   res.json({
     ok: true,
     name: 'azurekiln-qfli-server',
-    version: '1.0.0',
+    version: require('../package.json').version,
     db: db.driver,
   }),
 );

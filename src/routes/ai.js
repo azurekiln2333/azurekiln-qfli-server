@@ -1,4 +1,5 @@
-// AI 编程助手：服务端固定上游地址、密钥和模型，客户端只能提交消息与工具。
+// AI 编程助手：服务端管理上游地址和密钥。
+// 客户端从上游模型列表中选择模型。
 // 另提供联网抓取工具：web_fetch 带 SSRF 守卫。
 //
 // web_search 已于 2026-11 合规整改下线：搜索走 Bing，会引入未披露的第三方。
@@ -10,6 +11,15 @@ const ai = require('../ai-client');
 const webFetch = require('../web-fetch');
 
 const router = express.Router();
+
+router.get('/models', authRequired, async (req, res) => {
+  try {
+    const result = await ai.models({ req, res });
+    if (!res.destroyed) res.json(result);
+  } catch (error) {
+    if (!res.destroyed) throw error;
+  }
+});
 
 router.post('/chat', authRequired, async (req, res) => {
   let result;
