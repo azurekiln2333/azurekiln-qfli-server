@@ -65,6 +65,26 @@ function validModelId(value) {
     !/[\s\x00-\x1f\x7f]/.test(value);
 }
 
+// 推理强度是上游的扩展参数，默认不启用。只有运维在
+// QFLI_AI_REASONING_EFFORTS 里显式列出时才向客户端公布并向上游透传，
+// 避免把不支持的字段发给上游。
+const MAX_REASONING_EFFORTS = 8;
+function reasoningEfforts() {
+  const raw = (process.env.QFLI_AI_REASONING_EFFORTS || '').trim();
+  if (!raw) return [];
+  const seen = new Set();
+  const list = [];
+  for (const part of raw.split(',')) {
+    const value = part.trim().toLowerCase();
+    if (!/^[a-z][a-z0-9_-]{0,15}$/.test(value)) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    list.push(value);
+    if (list.length >= MAX_REASONING_EFFORTS) break;
+  }
+  return list;
+}
+
 function validateToolCalls(list, status, { allowIndex = false } = {}) {
   if (!Array.isArray(list) || list.length < 1 || list.length > MAX_TOOL_CALLS) {
     throw new ApiError(status, '工具调用格式无效');
@@ -175,7 +195,7 @@ function validateTools(tools) {
 }
 
 function validateRequest(value) {
-  if (!isPlainObject(value) || !onlyKeys(value, ['messages', 'tools', 'model']) ||
+  if (!isPlainObject(value) || !onlyKeys(value, ['messages', 'tools', 'model', 'reasoning_effort']) ||
       !Array.isArray(value.messages) || value.messages.length < 1 || value.messages.length > MAX_MESSAGES) {
     throw new ApiError(400, 'AI 请求无效或消息数量超过 100 条');
   }
@@ -184,8 +204,12 @@ function validateRequest(value) {
   if ('model' in value && !validModelId(value.model)) {
     throw new ApiError(400, 'AI 模型 ID 无效');
   }
+  if ('reasoning_effort' in value && !reasoningEfforts().includes(value.reasoning_effort)) {
+    throw new ApiError(400, '推理强度参数不可用');
+  }
   const request = { messages, ...(tools === undefined ? {} : { tools }),
-    ...('model' in value ? { model: value.model } : {}) };
+    ...('model' in value ? { model: value.model } : {}),
+    ...('reasoning_effort' in value ? { reasoning_effort: value.reasoning_effort } : {}) };
   const serialized = JSON.stringify(request);
   if (Buffer.byteLength(serialized) > MAX_REQUEST_BYTES) {
     throw new ApiError(413, 'AI 请求超过 512 KiB 限额');
@@ -265,6 +289,7 @@ function modelList(data) {
   }
   const seen = new Set();
   const models = [];
+  const efforts = reasoningEfforts();
   for (const entry of data.data) {
     if (!isPlainObject(entry) || !validModelId(entry.id)) {
       throw new ApiError(502, 'AI 模型列表格式无效');
@@ -275,6 +300,8 @@ function modelList(data) {
     if (Number.isSafeInteger(entry.created) && entry.created >= 0) model.created = entry.created;
     if (typeof entry.owned_by === 'string' && entry.owned_by.length <= 256 &&
         !/[\x00-\x1f\x7f]/.test(entry.owned_by)) model.owned_by = entry.owned_by;
+    // 运维开启时列出可选推理强度，客户端据此显示选择器。
+    if (efforts.length > 0) model.reasoning_efforts = efforts;
     models.push(model);
   }
   return { object: 'list', data: models };
@@ -422,7 +449,9 @@ async function chat(body, context = {}) {
         ...(context.req.requestId ? { 'X-Request-Id': context.req.requestId } : {}),
       },
       body: JSON.stringify({ model, messages: request.messages,
-        ...(request.tools === undefined ? {} : { tools: request.tools }) }),
+        ...(request.tools === undefined ? {} : { tools: request.tools }),
+        ...(request.reasoning_effort === undefined ? {} :
+          { reasoning_effort: request.reasoning_effort }) }),
     });
     log('ai.response', { status: response.status, model, messages: request.messages.length,
       tools: request.tools?.length || 0, durationMs: Date.now() - started });
@@ -444,6 +473,7 @@ function resetLimits() {
 module.exports = {
   configuration,
   validateRequest,
+  reasoningEfforts,
   models,
   chat,
   _resetLimits: resetLimits,

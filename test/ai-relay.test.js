@@ -726,3 +726,49 @@ test('oversized upstream responses are rejected', async () => {
   assert.match(body.error, /2 MiB/);
   await upstream.close();
 });
+
+test('reasoning effort is off by default and rejected when unset', async t => {
+  const upstream = await jsonUpstream({ choices: [{ message: {
+    role: 'assistant', content: 'ok' } }] });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  delete process.env.QFLI_AI_REASONING_EFFORTS;
+
+  const messages = [{ role: 'user', content: 'hi' }];
+  const rejected = await post({ messages, reasoning_effort: 'high' });
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.body.error, /推理强度/);
+
+  const models = await getModels();
+  assert.equal(models.status, 200);
+  for (const entry of models.body.data) {
+    assert.equal('reasoning_efforts' in entry, false);
+  }
+});
+
+test('configured reasoning efforts are advertised and forwarded', async t => {
+  let seen;
+  const upstream = await startUpstream(async (req, res) => {
+    seen = JSON.parse(await readBody(req));
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+  });
+  t.after(upstream.close);
+  t.after(() => { delete process.env.QFLI_AI_REASONING_EFFORTS; });
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  process.env.QFLI_AI_REASONING_EFFORTS = 'low, HIGH, bogus value, high';
+
+  const models = await getModels();
+  assert.equal(models.status, 200);
+  assert.deepEqual(models.body.data[0].reasoning_efforts, ['low', 'high']);
+
+  const messages = [{ role: 'user', content: 'hi' }];
+  const accepted = await post({ messages, reasoning_effort: 'high' });
+  assert.equal(accepted.status, 200);
+  assert.equal(seen.reasoning_effort, 'high');
+
+  const unknown = await post({ messages, reasoning_effort: 'medium' });
+  assert.equal(unknown.status, 400);
+  const wrongType = await post({ messages, reasoning_effort: 5 });
+  assert.equal(wrongType.status, 400);
+});
