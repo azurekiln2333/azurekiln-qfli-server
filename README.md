@@ -348,6 +348,97 @@ AI 响应固定带 `aiGenerated: true`。
 `POST /api/ai/web_search` 已下线（搜索走 Bing，属未披露的第三方），`src/web-search.js` 已删除；
 `POST /api/ai/web_fetch` 保留并继续执行 SSRF 守卫。
 
+#### 变量表
+
+| 变量 | 必填 | 默认 | 取值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `QFLI_AI_BASE_URL` | 是 | 空 | HTTPS 根地址 | OpenAI 兼容根地址，可带 `/v1`，后端保留路径前缀。合规要求指向 DeepSeek 官方接口。 |
+| `QFLI_AI_API_KEY` | 是 | 空 | 上游密钥 | 只放后端，不写客户端，不进日志。 |
+| `QFLI_AI_CONCURRENCY` | 否 | 2 | 1–8 | 每用户并发请求数。并行会话要调大。 |
+| `QFLI_AI_RATE_LIMIT` | 否 | 20 | 1–600 | 每用户每分钟请求数。并行会话要调大。 |
+| `QFLI_AI_MAX_INFLIGHT` | 否 | 16 | 1–64 | 全服务在途上限，保护小主机。 |
+| `QFLI_AI_TIMEOUT_MS` | 否 | 60000 | 100–120000 | 单次上游请求超时（毫秒）。 |
+| `QFLI_AI_REASONING_EFFORTS` | 否 | 空 | 逗号分隔，如 `low,medium,high` | 不配置则不向客户端公布，界面也不显示推理强度选择器。 |
+| `QFLI_AI_MODEL` | — | — | — | 已废弃，后端不再读取；模型来自上游列表。 |
+
+#### `.env` 示例
+
+值都是占位符，按实际环境替换：
+
+```ini
+QFLI_AI_BASE_URL=https://api.deepseek.com
+QFLI_AI_API_KEY=<上游密钥>
+QFLI_AI_CONCURRENCY=4
+QFLI_AI_RATE_LIMIT=80
+QFLI_AI_MAX_INFLIGHT=12
+QFLI_AI_TIMEOUT_MS=60000
+QFLI_AI_REASONING_EFFORTS=low,medium,high
+```
+
+#### 重启
+
+`docker-compose.yaml` 用 `env_file: - .env`，变量在**创建容器时**注入。
+只改 `.env` 而不重建容器，进程读到的还是旧值。
+
+```sh
+cd /data/qfli/server
+docker compose up -d --force-recreate server
+```
+
+只重建 `server` 服务，不动 `watchtower`，避免打断镜像更新器。
+全量写法 `docker compose up -d --force-recreate` 会连带重建 `watchtower`，功能相同但会中断一次更新轮询。
+`docker compose restart` 不重新读 `env_file`，不要用它改配置。
+
+#### 验证
+
+先取登录令牌（令牌只在本机 shell 变量里，不写进仓库）：
+
+```sh
+TOKEN=$(curl -s -X POST https://qfli.suanxiwanjie.cn/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"<账号>","password":"<密码>"}' \
+  | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).token))")
+```
+
+查模型列表：
+
+```sh
+curl -s -o /tmp/ai-models.json -w '%{http_code}\n' \
+  https://qfli.suanxiwanjie.cn/api/ai/models \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+| 状态码 | 含义 | 下一步 |
+| --- | --- | --- |
+| 200 | 配置生效，写入标准模型列表 `{object:"list",data:[...]}` | 查看 JSON 里的 `data[].id` |
+| 401 | 未登录或令牌已过期 | 重新登录取 `TOKEN` |
+| 403 | `realname.required`：账号没有已验证手机号，AI 与其他联网服务一律拒绝 | 先走华为账号绑定手机号 |
+| 503 | `AI 服务未配置`：缺 `BASE_URL` 或 `KEY`，或地址不是 HTTPS、格式无效 | 补 `.env` 后 `--force-recreate` |
+| 502 | `AI 服务凭据无效`：上游拒绝了密钥 | 核对 `QFLI_AI_API_KEY` 与上游控制台 |
+| 429 | 触发每用户限流或并发上限 | 见下面的并发与限流 |
+| 504 | 上游响应超时 | 调大 `QFLI_AI_TIMEOUT_MS` 或检查上游 |
+
+发一次聊天（不传 `model` 时用列表第一个）：
+
+```sh
+curl -s https://qfli.suanxiwanjie.cn/api/ai/chat \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"你好"}]}'
+```
+
+正常返回 `{aiGenerated:true,model,message:{role:"assistant",content}}`。
+
+#### 并行会话为什么要调大并发和限流
+
+- 每个运行中的会话占一个每用户并发名额。默认 2 表示最多 2 个会话同时打到上游，第 3 个立即 429「已有 AI 请求正在处理」。
+- 一轮 agent 循环里每次工具调用都是一次独立的 `/api/ai/chat` 请求。一个会话一分钟内很容易发出十几次，默认 20 次/分钟很快用完。
+- 客户端对 429 按 1 秒、2 秒、4 秒退避，最多 3 次；仍失败则本轮失败并提示重试。
+- 建议同时运行 N 个会话时：`QFLI_AI_CONCURRENCY` ≥ N（上限 8），`QFLI_AI_RATE_LIMIT` ≥ 20×N（上限 600）。
+- 全服务在途还受 `QFLI_AI_MAX_INFLIGHT` 与容器资源约束。2C2G 小主机建议 `QFLI_AI_MAX_INFLIGHT` ≤ 8，先保证 MySQL、终端执行器与业务接口不被挤占。
+
+合规提示：上游必须是已披露的服务方。不得改指向会引入未披露第三方的搜索或转售接口。
+
 成功登录返回 `{token,user}`，其中 `user.id` 是 `user_` 开头的字符串本地 ID，`user.gatewayUserId` 是网关 sub。`user.avatarUrl` 来自网关 `picture`，App 个人页显示该图片。
 受保护 API 使用 `Authorization: Bearer <QFLI token>`。社区、云项目、在线终端 API 保持原路径。
 本地项目与文件操作只能由客户端上报，服务端无法核验设备文件系统。默认每种操作设每日 1、5、10 次任务，达到每个档位时分别领取一次；`GET /me/tasks` 返回当日 `day`、每档 `progress/target/eventKey/done`。客户端逐次保存本机计数及待同步事件，断网后使用同一个 `eventId` 重试；任务、签到日历和积分兑换数据优先读取账号本地缓存，每天自动更新一次，手动刷新强制重取。兑换项由管理员创建，服务端只记录待处理/已交付，不自动发货。积分流水记录本次上线后发生的变动，历史签到不会自动回填流水。
