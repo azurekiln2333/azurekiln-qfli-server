@@ -2,6 +2,7 @@
 // 模型来自上游标准列表，客户端可从列表中选择。
 const { ApiError } = require('./gateway');
 const { log, stage } = require('./logging');
+const { StringDecoder } = require('node:string_decoder');
 
 const MODELS_CACHE_MS = 60 * 1000;
 const MAX_MODELS = 4096;
@@ -10,12 +11,17 @@ const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_ARGUMENT_BYTES = 256 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_RESPONSE_TEXT = 512 * 1024;
+// 流式回合额外限制：思考正文、上游总字节、单行长度。
+const MAX_REASONING_TEXT = 512 * 1024;
+const MAX_REASONING_BYTES = 256 * 1024;
+const MAX_STREAM_BYTES = 4 * 1024 * 1024;
+const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_TOOLS_BYTES = 64 * 1024;
 const MAX_MESSAGES = 100;
 const MAX_TOOL_CALLS = 16;
 const MAX_TOOLS = 64;
 const RATE_WINDOW_MS = 60 * 1000;
-const MESSAGE_KEYS = ['role', 'content', 'tool_calls', 'tool_call_id'];
+const MESSAGE_KEYS = ['role', 'content', 'tool_calls', 'tool_call_id', 'reasoning_content'];
 const ROLES = new Set(['system', 'user', 'assistant', 'tool']);
 const NAME_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
 
@@ -36,6 +42,8 @@ function boundedInt(value, fallback, min, max) {
 function limits() {
   return {
     timeoutMs: boundedInt(process.env.QFLI_AI_TIMEOUT_MS, 60000, 100, 120000),
+    streamIdleMs: boundedInt(process.env.QFLI_AI_STREAM_IDLE_MS, 60000, 5000, 300000),
+    streamMaxMs: boundedInt(process.env.QFLI_AI_STREAM_MAX_MS, 600000, 60000, 1800000),
     rate: boundedInt(process.env.QFLI_AI_RATE_LIMIT, 20, 1, 600),
     concurrency: boundedInt(process.env.QFLI_AI_CONCURRENCY, 2, 1, 8),
     maxInflight: boundedInt(process.env.QFLI_AI_MAX_INFLIGHT, 16, 1, 64),
@@ -125,6 +133,15 @@ function validateMessage(message, index) {
   if (typeof message.content === 'string' && Buffer.byteLength(message.content) > MAX_MESSAGE_BYTES) {
     throw new ApiError(413, `第 ${index + 1} 条消息超过 256 KiB 限额`);
   }
+  // 思考内容回传：只有助手消息可以带，值必须是字符串。
+  if ('reasoning_content' in message &&
+      (message.role !== 'assistant' || typeof message.reasoning_content !== 'string')) {
+    throw new ApiError(400, `第 ${index + 1} 条消息思考内容无效`);
+  }
+  if (typeof message.reasoning_content === 'string' &&
+      Buffer.byteLength(message.reasoning_content) > MAX_REASONING_BYTES) {
+    throw new ApiError(413, `第 ${index + 1} 条消息思考内容超过 256 KiB 限额`);
+  }
   const canonical = { role: message.role, content: message.content };
   if (message.role === 'tool') {
     if (typeof message.content !== 'string' ||
@@ -137,6 +154,7 @@ function validateMessage(message, index) {
   }
   if ('tool_call_id' in message) throw new ApiError(400, '只有工具结果消息可以带 tool_call_id');
   if (message.role === 'assistant') {
+    if ('reasoning_content' in message) canonical.reasoning_content = message.reasoning_content;
     if (typeof message.content === 'string' && !message.content && !('tool_calls' in message)) {
       throw new ApiError(400, '助手消息内容为空');
     }
@@ -363,6 +381,14 @@ function resultData(data, model) {
       toolCalls = validateToolCalls(message.tool_calls, 502, { allowIndex: true });
     }
   }
+  // 思考内容是可选的已知字段，只允许字符串，且不透传其他上游元数据。
+  const reasoning = message.reasoning_content;
+  if (reasoning !== undefined && reasoning !== null) {
+    if (typeof reasoning !== 'string') throw new ApiError(502, 'AI 服务响应无效');
+    if (Buffer.byteLength(reasoning) > MAX_REASONING_TEXT) {
+      throw new ApiError(502, 'AI 服务思考内容超过 512 KiB 限额');
+    }
+  }
   // 无工具调用时必须有非空文本，否则客户端无法渲染这一轮。
   if (!toolCalls && !content) throw new ApiError(502, 'AI 服务响应无效');
   const result = {
@@ -373,6 +399,8 @@ function resultData(data, model) {
       role: 'assistant',
       content,
       ...(toolCalls === undefined ? {} : { tool_calls: toolCalls }),
+      // 空字符串不写入，旧客户端的响应结构保持不变。
+      ...(reasoning ? { reasoning_content: reasoning } : {}),
     },
   };
   const usage = usageData(data.usage);
@@ -380,14 +408,20 @@ function resultData(data, model) {
   return result;
 }
 
-async function withRequest(config, { req, res }, operation) {
+async function withRequest(config, { req, res, phase }, operation) {
   if (!req || typeof req.userId !== 'string') throw new ApiError(401, '未登录或登录已过期');
   admit(req.userId);
 
   const started = Date.now();
   const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, config.timeoutMs);
+  const timing = { timedOut: false, timer: null };
+  // 首字节用 timeoutMs。流式回合拿到上游响应后改用空闲计时和总时长计时。
+  const arm = ms => {
+    clearTimeout(timing.timer);
+    timing.timer = setTimeout(() => { timing.timedOut = true; controller.abort(); }, ms);
+  };
+  const clock = { arm, expire() { timing.timedOut = true; controller.abort(); } };
+  arm(config.timeoutMs);
   const disconnect = () => controller.abort();
   if (req) req.once('aborted', disconnect);
   if (res) res.once('close', disconnect);
@@ -395,24 +429,25 @@ async function withRequest(config, { req, res }, operation) {
 
   try {
     controller.signal.throwIfAborted();
-    return await operation(controller.signal);
+    return await operation(controller.signal, clock);
   } catch (error) {
     if (error instanceof ApiError) throw error;
     const aborted = controller.signal.aborted;
     log('ai.dispatch_failed', {
+      ...(phase ? { phase } : {}),
       errorType: error.name,
       networkCode: error.cause?.code,
       aborted,
-      timedOut,
+      timedOut: timing.timedOut,
       durationMs: Date.now() - started,
     }, 'error');
     if (aborted) {
-      throw new ApiError(timedOut ? 504 : 499,
-        timedOut ? 'AI 请求超时，请稍后重试' : 'AI 请求已取消');
+      throw new ApiError(timing.timedOut ? 504 : 499,
+        timing.timedOut ? 'AI 请求超时，请稍后重试' : 'AI 请求已取消');
     }
     throw new ApiError(503, '无法连接 AI 服务');
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timing.timer);
     req?.off('aborted', disconnect);
     res?.off('close', disconnect);
     release(req.userId);
@@ -463,6 +498,199 @@ async function chat(body, context = {}) {
   });
 }
 
+// 解析上游 SSE：按行读，只处理 data: 行。
+// 增量边收边发。工具调用按 index 拼接。结束后再用 resultData 的规则生成权威结果。
+async function consumeStream(response, { emit, clock, idleMs, model }) {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+  let bytes = 0;
+  let done = false;
+  let content = '';
+  let reasoning = '';
+  let usage;
+  const calls = new Map();
+
+  const acceptCalls = async list => {
+    if (!Array.isArray(list)) throw new ApiError(502, 'AI 服务响应无效');
+    for (const call of list) {
+      if (!isPlainObject(call) || !Number.isSafeInteger(call.index) || call.index < 0) {
+        throw new ApiError(502, 'AI 服务响应无效');
+      }
+      let entry = calls.get(call.index);
+      if (!entry) {
+        if (calls.size >= MAX_TOOL_CALLS) throw new ApiError(502, '工具调用格式无效');
+        entry = { index: call.index, id: undefined, name: undefined, arguments: '', announced: false };
+        calls.set(call.index, entry);
+      }
+      if (call.id !== undefined) {
+        if (typeof call.id !== 'string') throw new ApiError(502, 'AI 服务响应无效');
+        entry.id = call.id;
+      }
+      if (call.type !== undefined && call.type !== 'function') {
+        throw new ApiError(502, 'AI 服务响应无效');
+      }
+      if (call.function !== undefined) {
+        if (!isPlainObject(call.function)) throw new ApiError(502, 'AI 服务响应无效');
+        if (call.function.name !== undefined) {
+          if (typeof call.function.name !== 'string') throw new ApiError(502, 'AI 服务响应无效');
+          if (call.function.name) entry.name = call.function.name;
+        }
+        if (call.function.arguments !== undefined) {
+          if (typeof call.function.arguments !== 'string') {
+            throw new ApiError(502, 'AI 服务响应无效');
+          }
+          entry.arguments += call.function.arguments;
+          if (Buffer.byteLength(entry.arguments) > MAX_ARGUMENT_BYTES) {
+            throw new ApiError(502, '工具调用格式无效');
+          }
+        }
+      }
+      // 某个调用第一次出现名字时通知界面一次，后续参数增量不再重复发。
+      if (!entry.announced && entry.name) {
+        entry.announced = true;
+        await emit({ type: 'tool_call', index: entry.index, name: entry.name });
+      }
+    }
+  };
+
+  const acceptLine = async line => {
+    // DeepSeek 的 keep-alive 是冒号开头的注释行，不产生事件。
+    if (line.startsWith(':') || !line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload) return;
+    if (payload === '[DONE]') { done = true; return; }
+    let data;
+    try { data = JSON.parse(payload); } catch { throw new ApiError(502, 'AI 服务响应无效'); }
+    if (!isPlainObject(data)) throw new ApiError(502, 'AI 服务响应无效');
+    // 上游在流中返回错误时只写统一文案，不透传上游正文。
+    if (data.error !== undefined && data.error !== null) {
+      throw new ApiError(502, 'AI 服务拒绝了请求');
+    }
+    const chunkUsage = usageData(data.usage);
+    if (chunkUsage) usage = chunkUsage;
+    if (!Array.isArray(data.choices)) throw new ApiError(502, 'AI 服务响应无效');
+    // 用量分片的 choices 是空列表。
+    const delta = data.choices[0]?.delta;
+    if (delta === undefined) return;
+    if (!isPlainObject(delta)) throw new ApiError(502, 'AI 服务响应无效');
+    const reasoningPart = delta.reasoning_content ?? delta.reasoning;
+    if (reasoningPart !== undefined && reasoningPart !== null) {
+      if (typeof reasoningPart !== 'string') throw new ApiError(502, 'AI 服务响应无效');
+      if (reasoningPart) {
+        reasoning += reasoningPart;
+        if (Buffer.byteLength(reasoning) > MAX_REASONING_TEXT) {
+          throw new ApiError(502, 'AI 服务思考内容超过 512 KiB 限额');
+        }
+        await emit({ type: 'reasoning', text: reasoningPart });
+      }
+    }
+    if (delta.content !== undefined && delta.content !== null) {
+      if (typeof delta.content !== 'string') throw new ApiError(502, 'AI 服务响应无效');
+      if (delta.content) {
+        content += delta.content;
+        if (Buffer.byteLength(content) > MAX_RESPONSE_TEXT) {
+          throw new ApiError(502, 'AI 服务响应内容超过 512 KiB 限额');
+        }
+        await emit({ type: 'content', text: delta.content });
+      }
+    }
+    if (delta.tool_calls !== undefined && delta.tool_calls !== null) {
+      await acceptCalls(delta.tool_calls);
+    }
+  };
+
+  for await (const chunk of response.body) {
+    bytes += chunk.length;
+    if (bytes > MAX_STREAM_BYTES) throw new ApiError(502, 'AI 服务响应超过 4 MiB 限额');
+    // 任何字节到达都重置空闲计时，注释行也算。
+    clock.arm(idleMs);
+    pending += decoder.write(Buffer.from(chunk));
+    let newline;
+    while ((newline = pending.indexOf('\n')) !== -1) {
+      const line = pending.slice(0, newline).replace(/\r$/, '');
+      pending = pending.slice(newline + 1);
+      if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
+        throw new ApiError(502, 'AI 服务事件行超过 1 MiB 限额');
+      }
+      await acceptLine(line);
+      if (done) break;
+    }
+    if (done) break;
+    if (Buffer.byteLength(pending) > MAX_LINE_BYTES) {
+      throw new ApiError(502, 'AI 服务事件行超过 1 MiB 限额');
+    }
+  }
+  // 没有 [DONE] 说明上游提前断开，不回一个半成品结果。
+  if (!done) throw new ApiError(502, 'AI 服务响应提前结束');
+
+  const list = [...calls.values()]
+    .sort((left, right) => left.index - right.index)
+    .map(call => ({ id: call.id, type: 'function', index: call.index,
+      function: { name: call.name, arguments: call.arguments } }));
+  const message = { role: 'assistant', content: content === '' ? null : content };
+  if (list.length) message.tool_calls = list;
+  const result = resultData({ choices: [{ message }], ...(usage ? { usage } : {}) }, model);
+  if (reasoning) result.message.reasoning_content = reasoning;
+  await emit({ type: 'result', ...result });
+  return result;
+}
+
+// 流式回合：把上游 SSE 组装成 NDJSON 事件。
+// 响应头发出前的错误照旧抛出，发出后的错误由路由写成 error 事件。
+async function chatStream(body, context = {}, emit) {
+  const config = configuration();
+  const request = validateRequest(body);
+  stage('ai.stream');
+  return withRequest(config, { ...context, phase: 'stream' }, async (signal, clock) => {
+    const catalog = await fetchModels(config, signal, context.req.requestId);
+    const model = request.model ?? catalog.data[0]?.id;
+    if (!model) throw new ApiError(503, 'AI 服务没有可用模型');
+    if (!catalog.data.some(entry => entry.id === model)) {
+      throw new ApiError(400, '所选 AI 模型不可用，请刷新模型列表');
+    }
+    const started = Date.now();
+    const response = await fetch(config.endpoint, {
+      method: 'POST',
+      redirect: 'error',
+      signal,
+      headers: {
+        authorization: `Bearer ${config.key}`,
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+        ...(context.req.requestId ? { 'X-Request-Id': context.req.requestId } : {}),
+      },
+      body: JSON.stringify({ model, messages: request.messages,
+        ...(request.tools === undefined ? {} : { tools: request.tools }),
+        ...(request.reasoning_effort === undefined ? {} :
+          { reasoning_effort: request.reasoning_effort }),
+        stream: true, stream_options: { include_usage: true } }),
+    });
+    log('ai.response', { status: response.status, model, messages: request.messages.length,
+      tools: request.tools?.length || 0, stream: true, durationMs: Date.now() - started });
+    if (!response.ok) {
+      try { await response.body?.cancel(); } catch (_) { /* 忽略取消失败 */ }
+      throw upstreamError(response.status);
+    }
+    if (!response.body) throw new ApiError(502, 'AI 服务响应无效');
+    // 上游响应到达后首字节计时结束，换成空闲计时，另起总时长计时。
+    clock.arm(config.streamIdleMs);
+    const total = setTimeout(() => clock.expire(), config.streamMaxMs);
+    try {
+      await emit({ type: 'start', model, aiGenerated: true });
+      return await consumeStream(response, { emit, clock, idleMs: config.streamIdleMs, model });
+    } catch (error) {
+      // 流中途失败记日志，不带正文、思考内容或密钥。
+      if (error instanceof ApiError) {
+        log('ai.dispatch_failed', { phase: 'stream', status: error.status,
+          durationMs: Date.now() - started }, 'error');
+      }
+      throw error;
+    } finally {
+      clearTimeout(total);
+    }
+  });
+}
+
 function resetLimits() {
   active.clear();
   windows.clear();
@@ -476,5 +704,6 @@ module.exports = {
   reasoningEfforts,
   models,
   chat,
+  chatStream,
   _resetLimits: resetLimits,
 };

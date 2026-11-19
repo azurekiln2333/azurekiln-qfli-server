@@ -772,3 +772,31 @@ test('configured reasoning efforts are advertised and forwarded', async t => {
   const wrongType = await post({ messages, reasoning_effort: 5 });
   assert.equal(wrongType.status, 400);
 });
+
+test('chat returns the upstream reasoning content and rejects malformed values', async t => {
+  const upstream = await startUpstream(async (req, res) => {
+    await readBody(req);
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '答案',
+      reasoning_content: '先想一步' } }] }));
+  });
+  t.after(upstream.close);
+  process.env.QFLI_AI_BASE_URL = upstream.base;
+  const { status, body } = await post({ messages: [{ role: 'user', content: '问' }] });
+  assert.equal(status, 200);
+  assert.deepEqual(body.message,
+    { role: 'assistant', content: '答案', reasoning_content: '先想一步' });
+
+  // 非字符串和超限的思考内容都按上游响应无效处理。
+  for (const reasoning_content of [5, 'x'.repeat(512 * 1024 + 1)]) {
+    const bad = await startUpstream(async (req, res) => {
+      await readBody(req);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '答案',
+        reasoning_content } }] }));
+    });
+    process.env.QFLI_AI_BASE_URL = bad.base;
+    assert.equal((await post({ messages: [{ role: 'user', content: '问' }] })).status, 502);
+    await bad.close();
+  }
+});

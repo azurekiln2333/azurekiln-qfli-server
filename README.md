@@ -348,6 +348,20 @@ AI 响应固定带 `aiGenerated: true`。
 `POST /api/ai/web_search` 已下线（搜索走 Bing，属未披露的第三方），`src/web-search.js` 已删除；
 `POST /api/ai/web_fetch` 保留并继续执行 SSRF 守卫。
 
+| 路径 | 内容 |
+| --- | --- |
+| `GET /api/ai/models` | 已登录客户端取模型列表 |
+| `POST /api/ai/chat` | 非流式回合，返回 `{aiGenerated,model,message,usage?}` |
+| `POST /api/ai/chat/stream` | 流式回合，返回 NDJSON 事件流，沿用 `/chat` 的请求体和限流 |
+| `POST /api/ai/web_fetch` | 抓取网页，执行 SSRF 守卫 |
+
+`/api/ai/chat/stream` 逐行推送 `start`、`reasoning`、`content`、`tool_call`、`result`、`error` 六种事件。
+响应头发出前的错误照旧返回 HTTP 状态码，发出后用 `error` 事件传递。
+`result` 是唯一权威结果，增量只用于显示。
+上游的 `reasoning_content` 或 `reasoning` 转成 `reasoning` 事件，并写进 `result.message.reasoning_content`。
+助手消息可以带 `reasoning_content` 回传思考内容：只允许助手角色，单条不超过 256 KiB。
+旧接口 `/api/ai/chat` 的行为不变，只在有思考内容时多返回 `message.reasoning_content`。
+
 #### 变量表
 
 | 变量 | 必填 | 默认 | 取值 | 说明 |
@@ -357,7 +371,9 @@ AI 响应固定带 `aiGenerated: true`。
 | `QFLI_AI_CONCURRENCY` | 否 | 2 | 1–8 | 每用户并发请求数。并行会话要调大。 |
 | `QFLI_AI_RATE_LIMIT` | 否 | 20 | 1–600 | 每用户每分钟请求数。并行会话要调大。 |
 | `QFLI_AI_MAX_INFLIGHT` | 否 | 16 | 1–64 | 全服务在途上限，保护小主机。 |
-| `QFLI_AI_TIMEOUT_MS` | 否 | 60000 | 100–120000 | 单次上游请求超时（毫秒）。 |
+| `QFLI_AI_TIMEOUT_MS` | 否 | 60000 | 100–120000 | 非流式回合的上游请求超时（毫秒）。流式回合用它做首字节超时。 |
+| `QFLI_AI_STREAM_IDLE_MS` | 否 | 60000 | 5000–300000 | 流式回合的空闲超时（毫秒）。任何字节到达都重新计时。 |
+| `QFLI_AI_STREAM_MAX_MS` | 否 | 600000 | 60000–1800000 | 流式回合的总时长上限（毫秒）。 |
 | `QFLI_AI_REASONING_EFFORTS` | 否 | 空 | 逗号分隔，如 `low,medium,high` | 不配置则不向客户端公布，界面也不显示推理强度选择器。 |
 | `QFLI_AI_MODEL` | — | — | — | 已废弃，后端不再读取；模型来自上游列表。 |
 
@@ -372,6 +388,8 @@ QFLI_AI_CONCURRENCY=4
 QFLI_AI_RATE_LIMIT=80
 QFLI_AI_MAX_INFLIGHT=12
 QFLI_AI_TIMEOUT_MS=60000
+QFLI_AI_STREAM_IDLE_MS=60000
+QFLI_AI_STREAM_MAX_MS=600000
 QFLI_AI_REASONING_EFFORTS=low,medium,high
 ```
 

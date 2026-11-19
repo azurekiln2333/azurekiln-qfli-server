@@ -7,10 +7,15 @@
 const express = require('express');
 const { authRequired } = require('../util');
 const { audit } = require('../audit');
+const { ApiError } = require('../gateway');
+const { openNdjsonStream } = require('../ndjson-stream');
 const ai = require('../ai-client');
 const webFetch = require('../web-fetch');
 
 const router = express.Router();
+
+// 下游事件流的字节上限。正文和思考各 512 KiB，result 再重复一份。
+const MAX_EVENT_BYTES = 8 * 1024 * 1024;
 
 router.get('/models', authRequired, async (req, res) => {
   try {
@@ -35,6 +40,37 @@ router.post('/chat', authRequired, async (req, res) => {
     detail: `model=${result.model} toolCalls=${result.message.tool_calls?.length || 0}`,
   });
   if (!res.destroyed) res.json(result);
+});
+
+// 流式回合：响应头发出前的错误照旧返回 HTTP 状态码，
+// 发出后的错误写一行 error 事件再结束，所以写入函数要等到第一次发事件才建。
+router.post('/chat/stream', authRequired, async (req, res) => {
+  let write = null;
+  const emit = event => {
+    write ??= openNdjsonStream(res, { maxBytes: MAX_EVENT_BYTES, closed: 'AI 连接已断开',
+      overflow: 'AI 事件流超过限额', timeout: 'AI 客户端接收超时' });
+    return write(event);
+  };
+  let result;
+  try {
+    result = await ai.chatStream(req.body, { req, res }, emit);
+  } catch (error) {
+    if (res.destroyed) return;
+    if (!res.headersSent) throw error;
+    try {
+      await emit({ type: 'error', status: error instanceof ApiError ? error.status : 502,
+        error: error instanceof ApiError ? error.message : 'AI 服务响应异常' });
+      res.end();
+    } catch { res.destroy(); }
+    return;
+  }
+  if (!res.destroyed && !res.writableEnded) res.end();
+  await audit(req, {
+    action: 'ai.chat',
+    target: `ai:${req.userId}`,
+    detail: `model=${result.model} toolCalls=${result.message.tool_calls?.length || 0} ` +
+      `stream=1 reasoningChars=${result.message.reasoning_content?.length || 0}`,
+  });
 });
 
 // ---- 联网工具 ----
