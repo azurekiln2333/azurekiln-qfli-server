@@ -2,6 +2,7 @@
 // This module is node-parameterized so the pool can pick any isolated executor.
 const { ApiError } = require('./gateway');
 const { log, stage } = require('./logging');
+const { openNdjsonStream } = require('./ndjson-stream');
 const { StringDecoder } = require('node:string_decoder');
 
 const MAX_OUTPUT = 100 * 1024;
@@ -219,33 +220,8 @@ async function executeStream(node, value, req, res, emit) {
 }
 
 function openStream(res) {
-  res.status(200).set({ 'Content-Type': 'application/x-ndjson; charset=utf-8',
-    'Cache-Control': 'no-store, no-transform', 'X-Accel-Buffering': 'no' });
-  res.flushHeaders();
-  let bytes = 0;
-  return async event => {
-    if (res.destroyed || res.writableEnded) throw new ApiError(499, '终端连接已断开');
-    const line = `${JSON.stringify(event)}\n`;
-    bytes += Buffer.byteLength(line);
-    if (bytes > MAX_STREAM) throw new ApiError(413, '终端事件流超过限额');
-    if (res.write(line)) return;
-    await new Promise((resolve, reject) => {
-      const finish = error => {
-        clearTimeout(timer);
-        res.off('drain', drain);
-        res.off('close', close);
-        res.off('error', close);
-        error ? reject(error) : resolve();
-      };
-      const drain = () => finish();
-      const close = () => finish(new ApiError(499, '终端连接已断开'));
-      const timer = setTimeout(() => finish(new ApiError(504, '终端客户端接收超时')), 5000);
-      res.once('drain', drain);
-      res.once('close', close);
-      res.once('error', close);
-      if (res.destroyed) close();
-    });
-  };
+  return openNdjsonStream(res, { maxBytes: MAX_STREAM, closed: '终端连接已断开',
+    overflow: '终端事件流超过限额', timeout: '终端客户端接收超时' });
 }
 
 async function reset(node, req, res, userId) {
